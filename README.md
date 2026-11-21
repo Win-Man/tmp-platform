@@ -1,5 +1,7 @@
 # TMP · TiDB 管理平台
 
+[![CI](https://github.com/Win-Man/tmp-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Win-Man/tmp-platform/actions/workflows/ci.yml)
+
 面向 DBA 的轻量级 TiDB 集群管理平台：接管 TiUP 部署的集群，三通道采集集群信息，提供拓扑/实例/用户/参数/会话视图、异步任务引擎、内置 28 项巡检与可下载报告。
 
 - **单二进制交付**：Go + Gin + GORM + SQLite（纯 Go 驱动，无 CGO），前端构建产物 `//go:embed` 内嵌。
@@ -64,6 +66,7 @@ make build      # 首次会自动 npm install（较慢），之后增量构建
 - **`backend/web/dist/` 不入库**（前端构建产物，见 `.gitignore`）。所以单独执行 `cd backend && go build ./...` 前需先 `make frontend-build`，否则 `//go:embed all:dist` 找不到文件；直接 `make build` 会自动按 typecheck → 前端 → 后端 顺序执行。
 - **提交前自检**：`make typecheck && make test && make vet`（`make smoke` 会真实起服务跑端到端断言，耗时约 30s）。
 - **分支约定**：`main` 保持可构建；功能开发走 `feat/xxx`、修复走 `fix/xxx`，PR 合入前跑一遍 `make smoke`。
+- **CI（GitHub Actions）**：push / PR 触发 [`ci.yml`](.github/workflows/ci.yml) 三个 job —— 后端（gofmt / vet / 单测 / `-race`）、前端（typecheck / build）、集成（`make build` + `scripts/smoke.sh` 端到端断言），集成 job 会上传 `tmp-binary-<sha>` 二进制产物（保留 7 天）。
 - **协作注意**：`tmp.db`、`data/secret.key`、`*.log` 均被忽略，不要提交；本地凭据与密钥不要写进代码或文档。
 
 ## 架构与目录

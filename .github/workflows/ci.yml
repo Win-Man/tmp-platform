@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的新推送会取消上一轮未完成的构建，避免浪费 runner。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  backend:
+    name: 后端 · 格式 / 静态检查 / 单测
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      # backend/web/dist 是前端产物、不入库，但 //go:embed 在编译期要求目录存在。
+      # 本 job 只验证后端逻辑，用占位文件满足 embed，真实产物的集成验证在 e2e job。
+      - name: 准备 embed 占位产物
+        run: |
+          mkdir -p backend/web/dist
+          printf '<!doctype html><title>placeholder</title>\n' > backend/web/dist/index.html
+
+      - name: gofmt 检查
+        working-directory: backend
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未格式化，请执行 gofmt -w backend/internal backend/cmd"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt 检查通过"
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: 单元测试
+        working-directory: backend
+        run: CGO_ENABLED=0 go test ./... -count=1
+
+      - name: 单元测试（race detector）
+        working-directory: backend
+        run: CGO_ENABLED=1 go test ./... -race -count=1
+
+  frontend:
+    name: 前端 · 类型检查 / 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装依赖
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: 类型检查
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: 构建
+        working-directory: frontend
+        run: npm run build
+
+  e2e:
+    name: 集成 · 单二进制构建 + 端到端冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      # 与本地发布同一条链路：类型检查 → 前端 → 后端（前端产物 go:embed 进二进制）
+      - name: make build
+        run: make build
+
+      - name: 冒烟（演示模式跑通登录/采集/巡检/报告/任务）
+        run: bash scripts/smoke.sh
+
+      - name: 上传单二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmp-binary-${{ github.sha }}
+          path: bin/tmp
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: 失败时输出服务日志
+        if: failure()
+        run: |
+          find /tmp -maxdepth 3 -name 'server.log' -print -exec tail -n 120 {} \; 2>/dev/null || true
