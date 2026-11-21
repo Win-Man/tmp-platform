@@ -1,0 +1,22 @@
+package model
+
+import "time"
+
+// Session processlist 会话快照。
+type Session struct {
+	ID        int64     `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
+	ClusterID int64     `gorm:"column:cluster_id;not null" json:"clusterId"`
+	SessionID int64     `gorm:"column:session_id;not null" json:"sessionId"`
+	UserName  string    `gorm:"column:user_name;type:text" json:"userName"`
+	Host      string    `gorm:"column:host;type:text" json:"host"`
+	DB        string    `gorm:"column:db;type:text" json:"db"`
+	Command   string    `gorm:"column:command;type:text" json:"command"`
+	TimeSec   int       `gorm:"column:time_sec;not null;default:0" json:"timeSec"`
+	State     string    `gorm:"column:state;type:text" json:"state"`
+	SQLDigest string    `gorm:"column:sql_digest;type:text" json:"sqlDigest"`
+	FetchedAt time.Time `gorm:"column:fetched_at;not null" json:"fetchedAt"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"createdAt"`
+}
+
+// TableName 固定表名。
+func (Session) TableName() string { return "sessions" }

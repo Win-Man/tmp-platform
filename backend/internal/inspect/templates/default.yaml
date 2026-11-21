@@ -1,0 +1,281 @@
+# TMP 内置巡检模板：6 大类 28 项
+# 说明：expr 为可读判定表达式，真实判定逻辑由 internal/inspect/checkers.go 的
+# 函数注册表按 code 实现（D-3：内置可扩展规则，不做可视化规则编辑器）。
+code: default_full
+name: 默认全量巡检
+description: 覆盖系统层、TiDB 配置、安全合规、容量水位、高可用、版本规范六大类的通用最佳实践检查项。
+items:
+  # ---------- 系统层 ----------
+  - code: SYS-01
+    name: 主机 CPU 使用率
+    category: system
+    checkMethod: ssh
+    severity: warning
+    expr: "cpuUsagePct < threshold.cpu_pct"
+    expect: "所有主机 CPU 使用率低于阈值（默认 80%）"
+    suggestion: "定位高 CPU 主机上的热点查询或异常进程，必要时扩缩容或优化 SQL。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/dashboard-cluster-info"
+    sortOrder: 10
+  - code: SYS-02
+    name: 主机内存使用率
+    category: system
+    checkMethod: ssh
+    severity: warning
+    expr: "memUsagePct < 85"
+    expect: "所有主机内存使用率低于 85%"
+    suggestion: "检查 TiKV block cache 与 TiDB 内存上限配置，避免 OOM。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/tune-tikv-memory-performance"
+    sortOrder: 20
+  - code: SYS-03
+    name: 主机磁盘使用率
+    category: system
+    checkMethod: ssh
+    severity: critical
+    expr: "diskUsagePct < threshold.disk_pct"
+    expect: "所有主机磁盘使用率低于阈值（默认 85%）"
+    suggestion: "清理历史日志与备份文件，或扩容磁盘；磁盘写满会导致 TiKV 服务不可用。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/hardware-and-software-requirements"
+    sortOrder: 30
+  - code: SYS-04
+    name: CPU 架构一致性
+    category: system
+    checkMethod: ssh
+    severity: warning
+    expr: "distinct(cpuArch) == 1"
+    expect: "集群内全部主机 CPU 架构一致（均为 x86_64 或均为 aarch64）"
+    suggestion: "混合架构部署会带来二进制兼容与性能差异风险，建议统一机型。"
+    sortOrder: 40
+  - code: SYS-05
+    name: 采集数据新鲜度
+    category: system
+    checkMethod: sql
+    severity: warning
+    expr: "now - fetchedAt <= 3600s"
+    expect: "最近一次成功采集在 1 小时内"
+    suggestion: "检查采集配置与网络连通性，确认定时采集任务正常运行。"
+    sortOrder: 50
+
+  # ---------- TiDB 配置 ----------
+  - code: CFG-01
+    name: 单条 SQL 内存上限
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "tidb_mem_quota_query > 0"
+    expect: "tidb_mem_quota_query 已设置有限值"
+    suggestion: "将 tidb_mem_quota_query 设置为合理上限（如 1GB~4GB），避免单条 SQL 打满实例内存。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/system-variables#tidb_mem_quota_query"
+    sortOrder: 60
+  - code: CFG-02
+    name: OOM 行为配置
+    category: tidb_config
+    checkMethod: sql
+    severity: critical
+    expr: "oom-action == 'cancel'"
+    expect: "oom-action 为 cancel"
+    suggestion: "将 oom-action 设为 cancel，使超限 SQL 被取消而不是仅记录日志。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/system-variables#tidb_mem_oom_action-从-v610-版本开始引入"
+    sortOrder: 70
+  - code: CFG-03
+    name: 慢查询日志开关
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "slow_query_log == 'ON'"
+    expect: "slow_query_log 为 ON"
+    suggestion: "开启慢查询日志，便于事后定位性能问题。"
+    sortOrder: 80
+  - code: CFG-04
+    name: 慢查询阈值
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "log_slow_query_threshold <= 300"
+    expect: "慢查询阈值不大于 300ms"
+    suggestion: "将慢查询阈值调整到 300ms 以内，避免慢 SQL 被遗漏。"
+    sortOrder: 90
+  - code: CFG-05
+    name: 最大连接数
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "max_connections >= 1000"
+    expect: "max_connections 不低于 1000"
+    suggestion: "结合业务并发评估最大连接数，过低会触发 too many connections。"
+    sortOrder: 100
+  - code: CFG-06
+    name: DistSQL 扫描并发度
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "tidb_distsql_scan_concurrency >= 8"
+    expect: "tidb_distsql_scan_concurrency 不低于 8"
+    suggestion: "扫描并发度过低会显著拖慢分析类查询，建议按 CPU 核数调整。"
+    sortOrder: 110
+  - code: CFG-07
+    name: Resource Control 开关
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "tidb_enable_resource_control == 'ON'"
+    expect: "tidb_enable_resource_control 为 ON"
+    suggestion: "开启资源管控，使 Resource Group 的 RU 限制生效。"
+    applies: "min_version:7.5.0"
+    sortOrder: 120
+  - code: CFG-08
+    name: 实例内存上限
+    category: tidb_config
+    checkMethod: sql
+    severity: warning
+    expr: "tidb_server_memory_limit not empty and != '0'"
+    expect: "tidb_server_memory_limit 已设置"
+    suggestion: "设置实例级内存上限并开启内存保护，避免单实例内存超卖。"
+    applies: "min_version:7.5.0"
+    sortOrder: 130
+
+  # ---------- 安全合规 ----------
+  - code: SEC-01
+    name: root 账号登录来源限制
+    category: security
+    checkMethod: sql
+    severity: critical
+    expr: "root 账号的 Host 不含 '%'"
+    expect: "root 仅允许 127.0.0.1 / localhost 登录"
+    suggestion: "回收 root 的远程登录权限，改用具备最小权限的运维账号。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/security-compatibility"
+    sortOrder: 140
+  - code: SEC-02
+    name: 通配 Host 业务账号
+    category: security
+    checkMethod: sql
+    severity: warning
+    expr: "count(users where host == '%' and user not in ('root')) == 0"
+    expect: "业务账号不使用 % 通配 Host"
+    suggestion: "将业务账号的 Host 收敛到具体网段，降低凭据泄露后的影响面。"
+    sortOrder: 150
+  - code: SEC-03
+    name: 账号数量规模
+    category: security
+    checkMethod: sql
+    severity: warning
+    expr: "userCount <= 50"
+    expect: "TiDB 账号数量不超过 50 个"
+    suggestion: "定期清理废弃账号，账号数量过多会加大权限治理成本。"
+    sortOrder: 160
+  - code: SEC-04
+    name: 域名解析开关
+    category: security
+    checkMethod: sql
+    severity: warning
+    expr: "skip_name_resolve == 'ON'"
+    expect: "skip_name_resolve 为 ON"
+    suggestion: "开启 skip_name_resolve，避免 DNS 反解导致的连接抖动与鉴权延迟。"
+    sortOrder: 170
+  - code: SEC-05
+    name: 锁定账号残留
+    category: security
+    checkMethod: sql
+    severity: warning
+    expr: "count(users where accountLocked == 'Y') == 0"
+    expect: "无处于锁定状态的账号"
+    suggestion: "确认锁定账号是否需要保留，废弃账号应直接删除。"
+    sortOrder: 180
+
+  # ---------- 容量水位 ----------
+  - code: CAP-01
+    name: TiKV 存储水位
+    category: capacity
+    checkMethod: pd_api
+    severity: critical
+    expr: "tikvUsedRatio < threshold.disk_pct / 100"
+    expect: "TiKV 已用存储低于阈值（默认 85%）"
+    suggestion: "TiKV 水位过高会触发 Region 调度受限，建议提前扩容或清理数据。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/hardware-and-software-requirements"
+    sortOrder: 190
+  - code: CAP-02
+    name: 单机实例密度
+    category: capacity
+    checkMethod: sql
+    severity: warning
+    expr: "instancesPerHost <= 8"
+    expect: "单台主机承载实例数不超过 8 个"
+    suggestion: "单机实例过于密集会放大单点故障影响，建议拆分部署。"
+    sortOrder: 200
+  - code: CAP-03
+    name: 主机数量
+    category: capacity
+    checkMethod: sql
+    severity: warning
+    expr: "hostCount >= 3"
+    expect: "集群主机数量不少于 3 台"
+    suggestion: "生产集群建议至少 3 台物理机，避免单机故障导致多数派丢失。"
+    sortOrder: 210
+
+  # ---------- 高可用 ----------
+  - code: HA-01
+    name: PD 副本数
+    category: ha
+    checkMethod: sql
+    severity: critical
+    expr: "count(instances where component == 'pd') >= 3"
+    expect: "PD 实例数不少于 3 个"
+    suggestion: "PD 少于 3 个不满足多数派要求，单点故障会导致集群不可调度。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/high-availability"
+    sortOrder: 220
+  - code: HA-02
+    name: TiKV 副本数
+    category: ha
+    checkMethod: sql
+    severity: critical
+    expr: "count(instances where component == 'tikv') >= 3"
+    expect: "TiKV 实例数不少于 3 个"
+    suggestion: "TiKV 少于 3 个时 Region 三副本无法满足，存在数据丢失风险。"
+    sortOrder: 230
+  - code: HA-03
+    name: TiDB 无单点
+    category: ha
+    checkMethod: sql
+    severity: warning
+    expr: "count(instances where component == 'tidb') >= 2"
+    expect: "TiDB 实例数不少于 2 个"
+    suggestion: "单 TiDB 实例存在计算层单点，建议至少部署 2 个并前置负载均衡。"
+    sortOrder: 240
+  - code: HA-04
+    name: 实例运行状态
+    category: ha
+    checkMethod: sql
+    severity: critical
+    expr: "count(instances where status != 'up') == 0"
+    expect: "全部实例状态为 up"
+    suggestion: "排查 Down/Unhealthy 实例的日志与主机资源，尽快恢复。"
+    sortOrder: 250
+  - code: HA-05
+    name: 部署模式
+    category: ha
+    checkMethod: pd_api
+    severity: warning
+    expr: "deployMode in ('majority', 'dr_auto_sync')"
+    expect: "部署模式为 majority 或 dr_auto_sync"
+    suggestion: "确认副本模式符合容灾要求；跨机房场景建议启用 DR Auto-Sync。"
+    sortOrder: 260
+
+  # ---------- 版本规范 ----------
+  - code: VER-01
+    name: TiDB 版本基线
+    category: version
+    checkMethod: sql
+    severity: critical
+    expr: "tidbVersion >= v6.5.0"
+    expect: "TiDB 版本不低于 v6.5.0"
+    suggestion: "低于 v6.5 的版本已停止维护，存在已知缺陷与安全风险，建议升级。"
+    docUrl: "https://docs.pingcap.com/zh/tidb/stable/release-notes"
+    sortOrder: 270
+  - code: VER-02
+    name: 组件版本一致性
+    category: version
+    checkMethod: sql
+    severity: warning
+    expr: "distinct(instanceVersion) == 1"
+    expect: "集群内各组件版本一致"
+    suggestion: "存在多版本组件时需尽快完成滚动升级，避免协议不兼容。"
+    sortOrder: 280
