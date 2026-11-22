@@ -158,7 +158,7 @@
 
       <template v-else>
         <div v-loading="loading">
-          <el-empty v-if="groups.length === 0" description="暂无分组数据" />
+          <el-empty v-if="groups.length === 0" :description="emptyText" />
           <div v-for="group in groups" :key="group.clusterId" class="host-group">
             <div class="group-head">
               <span class="group-name">{{ group.clusterName }}</span>
@@ -203,7 +203,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import { Refresh, Search } from '@element-plus/icons-vue'
@@ -231,6 +231,14 @@ const errorMessage = ref('')
 
 const filters = reactive({ keyword: '', arch: '', clusterId: undefined as number | undefined, page: 1, pageSize: 20 })
 
+/** 分组视图下是否有任一搜索/筛选条件生效（该视图没有 sshStatus 控件，故不纳入）。 */
+const hasActiveFilter = computed(
+  () => filters.keyword.trim() !== '' || filters.arch !== '' || filters.clusterId !== undefined,
+)
+
+/** 分组空态文案：无筛选 → 原文案；有筛选且无匹配 → 空白（对齐集群列表口径，用户明确不提示）。 */
+const emptyText = computed(() => (hasActiveFilter.value ? '' : '暂无分组数据'))
+
 /** 把筛选与分页写入 URL query。 */
 function syncUrl(): void {
   syncQuery(router, route.query, {
@@ -247,17 +255,20 @@ async function load(): Promise<void> {
   loading.value = true
   errorMessage.value = ''
   try {
-    const res = await hostApi.list({
-      page: filters.page,
-      pageSize: filters.pageSize,
+    const params = {
       keyword: filters.keyword || undefined,
       arch: filters.arch || undefined,
       clusterId: filters.clusterId || undefined,
+    }
+    const res = await hostApi.list({
+      page: filters.page,
+      pageSize: filters.pageSize,
+      ...params,
     })
     rows.value = res.list || []
     total.value = res.total || 0
     arches.value = res.arches || []
-    const grouped = await hostApi.grouped()
+    const grouped = await hostApi.grouped(params)
     groups.value = grouped.groups || []
   } catch (err) {
     rows.value = []

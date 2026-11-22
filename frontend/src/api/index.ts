@@ -346,10 +346,11 @@ export const tidbApi = {
 
 export const hostApi = {
   list: (params: Record<string, unknown>) => request<HostsPage>({ url: '/hosts', method: 'get', params }),
-  grouped: () =>
+  grouped: (params: Record<string, unknown>) =>
     request<{ groups: { clusterId: number; clusterName: string; hosts: HostRow[] }[] }>({
       url: '/hosts/grouped',
       method: 'get',
+      params,
     }),
   get: (id: number) => request<HostRow>({ url: `/hosts/${id}`, method: 'get' }),
   metrics: (id: number, range: string) =>

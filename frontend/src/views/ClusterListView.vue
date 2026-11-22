@@ -21,7 +21,7 @@
         <div class="toolbar-left">
           <el-input
             v-model="filters.keyword"
-            placeholder="集群名 / 主机 / 版本"
+            placeholder="集群名 / 主机 IP / 版本"
             clearable
             style="width: 220px"
             :prefix-icon="Search"
@@ -59,7 +59,7 @@
         v-loading="loading"
         :data="rows"
         row-key="id"
-        empty-text="暂无纳管集群，可点击右上角「接管集群」开始"
+        :empty-text="emptyText"
         @selection-change="onSelectionChange"
       >
         <el-table-column type="selection" width="44" :selectable="(row: ClusterBrief) => !row.draft" />
@@ -412,6 +412,25 @@ const removingJob = ref(false)
 const confirmName = ref('')
 
 const isAdmin = computed(() => auth.user?.role === 'admin')
+
+/**
+ * 是否有任一搜索/筛选条件生效。
+ *
+ * 用途：区分「平台真的还没有纳管集群」与「当前条件下没有匹配结果」两种空表格，
+ * 前者需要引导用户去「接管集群」，后者按用户反馈直接展示为空、不给任何提示。
+ */
+const hasActiveFilter = computed(
+  () =>
+    filters.keyword.trim() !== '' ||
+    filters.status !== '' ||
+    filters.deployMode !== '' ||
+    filters.arch !== '',
+)
+
+/** 表格空态文案：无任何条件时提示接管，有搜索/筛选条件时留空（用户明确要求不提示）。 */
+const emptyText = computed(() =>
+  hasActiveFilter.value ? '' : '暂无纳管集群，可点击右上角「接管集群」开始',
+)
 
 /** 提交按钮：编辑态 / 草稿态 / 已拿凭证 / admin 强制 四种情况之外一律置灰。 */
 const submitDisabled = computed(() => {
@@ -805,7 +824,14 @@ onMounted(async () => {
   filters.pageSize = queryInt(route.query, 'pageSize', 20)
   await load()
   // 首次进入若还没有集群，主动提示接管（避免空白困惑），每个页面会话只提示一次。
-  if (!takeoverHinted && rows.value.length === 0 && !errorMessage.value && auth.can('cluster.takeover')) {
+  // 带搜索/筛选条件时（含从 URL 恢复）不提示：那种空表格是「没匹配上」，不是「没纳管集群」。
+  if (
+    !takeoverHinted &&
+    rows.value.length === 0 &&
+    !errorMessage.value &&
+    !hasActiveFilter.value &&
+    auth.can('cluster.takeover')
+  ) {
     takeoverHinted = true
     ElMessageBox.alert('当前还没有纳管任何集群，点击「接管集群」开始。', '提示', {
       confirmButtonText: '知道了',

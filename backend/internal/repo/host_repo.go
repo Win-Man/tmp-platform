@@ -63,10 +63,12 @@ type HostRow struct {
 	Clusters []HostClusterBrief `json:"clusters"`
 }
 
-// List 分页查询主机。
-func (r *HostRepo) List(ctx context.Context, f HostFilter) ([]HostRow, int64, error) {
-	f.Page.Normalize()
-	q := r.db.WithContext(ctx).Model(&model.Host{})
+// applyHostFilter 把主机筛选条件应用到查询（List 与 ListAll 共用，避免两处维护）。
+//
+// keyword 命中 IP 或主机名，两条 LIKE 必须用括号包成一组 OR：否则与 arch / clusterId
+// 组合时会退化成 `ip LIKE ? OR hostname LIKE ? AND cpu_arch = ?`，后置过滤形同失效，
+// 表现为「搜 10.10. 却把 127.0.0.1 也带出来」。
+func (r *HostRepo) applyHostFilter(q *gorm.DB, f HostFilter) *gorm.DB {
 	if f.Arch != "" {
 		q = q.Where("cpu_arch = ?", f.Arch)
 	}
@@ -75,12 +77,18 @@ func (r *HostRepo) List(ctx context.Context, f HostFilter) ([]HostRow, int64, er
 	}
 	if kw := strings.TrimSpace(f.Keyword); kw != "" {
 		like := likePattern(kw)
-		q = q.Where("ip LIKE ? ESCAPE '\\' OR hostname LIKE ? ESCAPE '\\'", like, like)
+		q = q.Where("(ip LIKE ? ESCAPE '\\' OR hostname LIKE ? ESCAPE '\\')", like, like)
 	}
 	if f.ClusterID > 0 {
 		q = q.Where("id IN (SELECT host_id FROM instances WHERE cluster_id = ? AND host_id IS NOT NULL)", f.ClusterID)
 	}
-	q = q.Order("ip ASC")
+	return q
+}
+
+// List 分页查询主机。
+func (r *HostRepo) List(ctx context.Context, f HostFilter) ([]HostRow, int64, error) {
+	f.Page.Normalize()
+	q := r.applyHostFilter(r.db.WithContext(ctx).Model(&model.Host{}), f).Order("ip ASC")
 
 	var total int64
 	if err := q.Session(&gorm.Session{}).Count(&total).Error; err != nil {
@@ -97,13 +105,22 @@ func (r *HostRepo) List(ctx context.Context, f HostFilter) ([]HostRow, int64, er
 	return rows, total, nil
 }
 
-// All 返回所有主机（分组视图用）。
-func (r *HostRepo) All(ctx context.Context) ([]HostRow, error) {
+// ListAll 返回全部匹配主机（不带分页），分组视图用。
+//
+// 分组视图需要展示所有匹配主机，不能用分页的 List（否则只取第一页），
+// 但过滤语义与 List 完全一致，因此复用 applyHostFilter。
+func (r *HostRepo) ListAll(ctx context.Context, f HostFilter) ([]HostRow, error) {
+	q := r.applyHostFilter(r.db.WithContext(ctx).Model(&model.Host{}), f).Order("ip ASC")
 	var hosts []model.Host
-	if err := r.db.WithContext(ctx).Order("ip ASC").Find(&hosts).Error; err != nil {
+	if err := q.Find(&hosts).Error; err != nil {
 		return nil, err
 	}
 	return r.decorate(ctx, hosts)
+}
+
+// All 返回所有主机（无筛选，等价于 ListAll(HostFilter{})）。
+func (r *HostRepo) All(ctx context.Context) ([]HostRow, error) {
+	return r.ListAll(ctx, HostFilter{})
 }
 
 // ListByCluster 返回某集群承载实例的主机（拓扑按主机聚合用，不做额外装饰查询）。

@@ -33,7 +33,12 @@ func (h *Handlers) ListHosts(c *gin.Context) {
 
 // GroupedHosts GET /api/v1/hosts/grouped
 func (h *Handlers) GroupedHosts(c *gin.Context) {
-	groups, err := h.Hosts.Grouped(c.Request.Context())
+	f := repo.HostFilter{
+		ClusterID: Int64Query(c, "clusterId"),
+		Arch:      rawQuery(c, "arch"),
+		Keyword:   rawQuery(c, "keyword"),
+	}
+	groups, err := h.Hosts.Grouped(c.Request.Context(), f)
 	if err != nil {
 		Fail(c, err)
 		return

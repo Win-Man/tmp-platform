@@ -87,11 +87,46 @@ type ClusterFilter struct {
 	Page         Page
 }
 
+// keywordCondition 构造集群列表关键词的模糊匹配条件与参数。
+//
+// 关键词命中面（任一即命中，界面 placeholder 承诺「集群名 / 主机 IP / 版本」可搜）：
+//  1. clusters.name         集群名
+//  2. clusters.tiup_host    中控机 IP
+//  3. clusters.tidb_version TiDB 版本
+//  4. clusters.db_host      DB 连接地址
+//  5. instances.host_ip     该集群内任一实例所在主机
+//
+// 实例部分使用 EXISTS 子查询而不是 JOIN：一个集群有多条实例，JOIN 会把同一集群放大成多行，
+// 既让列表出现重复行，也会把分页 total 算大。
+//
+// 返回的条件整体用一层括号包住。本条是「多个 OR」，必须成组与 status / arch / draft 等
+// 后置条件做 AND；散架会退化成 `A OR B OR C AND status = ?`，后置过滤形同失效。
+//
+// 显式括号不可省略（不要因为测试全绿就删）：GORM 的自动补括号只是有条件触发的启发式，
+// v1.25.12 clause/where.go:buildExprs 仅在「Where 表达式多于 1 个」且「raw SQL 大写后
+// 含带空格的 " AND " / " OR "」时才补一层。以下任一变化都会让它静默失效：
+// 换行拼接、去掉 OR 两侧空格、改用 clause.OrConditions 混写、条件只剩单表达式；
+// 同时「括号被删」这件事现有测试守不住（GORM 兜住了，用例不会红）。
+// 故以显式括号为准，自动括号只当兜底。
+//
+// 大小写行为沿用 SQLite LIKE 默认的 ASCII 不敏感，与改造前一致。
+func keywordCondition(kw string) (string, []any) {
+	like := likePattern(kw)
+	cond := "(clusters.name LIKE ? ESCAPE '\\'" +
+		" OR clusters.tiup_host LIKE ? ESCAPE '\\'" +
+		" OR clusters.tidb_version LIKE ? ESCAPE '\\'" +
+		" OR clusters.db_host LIKE ? ESCAPE '\\'" +
+		" OR EXISTS (SELECT 1 FROM instances i" +
+		" WHERE i.cluster_id = clusters.id AND i.host_ip LIKE ? ESCAPE '\\'))"
+	return cond, []any{like, like, like, like, like}
+}
+
 // buildQuery 构造集群列表查询。
 func (r *ClusterRepo) buildQuery(ctx context.Context, f ClusterFilter) *gorm.DB {
 	q := r.db.WithContext(ctx).Model(&model.Cluster{})
 	if kw := strings.TrimSpace(f.Keyword); kw != "" {
-		q = q.Where("name LIKE ? ESCAPE '\\'", likePattern(kw))
+		cond, args := keywordCondition(kw)
+		q = q.Where(cond, args...)
 	}
 	if f.Version != "" {
 		q = q.Where("tidb_version = ?", f.Version)

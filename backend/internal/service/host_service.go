@@ -49,11 +49,11 @@ type ClusterHostGroup struct {
 	Hosts       []repo.HostRow `json:"hosts"`
 }
 
-// Grouped 按集群分组返回主机。
+// Grouped 按集群分组返回主机（应用 keyword / arch / clusterId 筛选）。
 //
 // 跨集群共享的主机会出现在多个分组中；未被任何集群承载的主机归入「未关联集群」分组。
-func (s *HostService) Grouped(ctx context.Context) ([]ClusterHostGroup, error) {
-	rows, err := s.hosts.All(ctx)
+func (s *HostService) Grouped(ctx context.Context, f repo.HostFilter) ([]ClusterHostGroup, error) {
+	rows, err := s.hosts.ListAll(ctx, f)
 	if err != nil {
 		return nil, apperr.Internal("查询主机失败")
 	}
