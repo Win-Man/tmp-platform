@@ -76,13 +76,20 @@ var privilegeWhitelist = map[string]bool{
 	"PROCESS": true, "SHOW DATABASES": true, "RELOAD": true, "REFERENCES": true,
 	"CREATE TEMPORARY TABLES": true, "LOCK TABLES": true, "EXECUTE": true,
 	"BACKUP_ADMIN": true, "PROCESSLIST": true, "SYSTEM_VARIABLES_ADMIN": true,
+	"ALL": true, "ALL PRIVILEGES": true,
 }
 
 // Privilege 校验权限名是否在白名单内，返回大写形式。
+//
+// ALL / ALL PRIVILEGES 归一化为 "ALL PRIVILEGES"（TiDB 的 GRANT ALL 等价形式），
+// 使拼接出的语句合法。
 func Privilege(p string) (string, error) {
 	up := strings.ToUpper(strings.TrimSpace(p))
 	if !privilegeWhitelist[up] {
 		return "", fmt.Errorf("%w: 权限 %q 不在白名单内", ErrIllegalIdent, p)
+	}
+	if up == "ALL" {
+		return "ALL PRIVILEGES", nil
 	}
 	return up, nil
 }

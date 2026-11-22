@@ -110,7 +110,7 @@
           <el-input v-model="createForm.host" placeholder="% 或 10.0.0.%" />
         </el-form-item>
         <el-form-item label="密码" prop="password">
-          <el-input v-model="createForm.password" type="password" show-password />
+          <el-input v-model="createForm.password" type="password" show-password placeholder="无复杂度限制，可与用户名相同" />
         </el-form-item>
         <el-form-item v-if="supportsRG" label="Resource Group">
           <el-select v-model="createForm.resourceGroup" clearable placeholder="可选" style="width: 100%">
@@ -154,7 +154,7 @@
             <el-input v-model="grantForm.db" placeholder="如 app_db" />
           </el-form-item>
           <el-form-item label="权限">
-            <el-input v-model="grantForm.privsText" placeholder="逗号分隔，如 SELECT,INSERT" />
+            <el-input v-model="grantForm.privsText" placeholder="逗号分隔，如 SELECT,INSERT，或 ALL 授予全部权限" />
           </el-form-item>
         </el-form>
       </template>

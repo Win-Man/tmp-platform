@@ -138,9 +138,6 @@ func (s *TiDBObjService) CreateUser(ctx context.Context, clusterID int64, in Cre
 	if _, err := sqlsafe.Host(host); err != nil {
 		return 0, apperr.BadRequest("Host 不合法")
 	}
-	if len(in.Password) < 8 {
-		return 0, apperr.BadRequest("密码长度需不少于 8 位")
-	}
 	if n, cerr := s.obj.CountUsersByName(ctx, clusterID, in.UserName, host); cerr == nil && n > 0 {
 		return 0, apperr.Conflict(fmt.Sprintf("用户 %s@%s 已存在", in.UserName, host))
 	}
@@ -232,9 +229,6 @@ func (s *TiDBObjService) ResetPassword(ctx context.Context, clusterID, snapshotI
 	u, err := s.obj.GetUserByID(ctx, clusterID, snapshotID)
 	if err != nil {
 		return 0, apperr.NotFound("TiDB 用户不存在")
-	}
-	if len(password) < 8 {
-		return 0, apperr.BadRequest("新密码长度需不少于 8 位")
 	}
 	var createdBy *int64
 	if operator != nil {

@@ -725,9 +725,6 @@ func (e *Engine) handleResetTiDBPassword(ctx context.Context, r *Runner) error {
 		if herr != nil {
 			return apperr.BadRequest("Host 不合法：" + herr.Error())
 		}
-		if len(p.Password) < 8 {
-			return apperr.BadRequest("新密码长度需不少于 8 位")
-		}
 		identQuoted, hostQuoted = q, hq
 		r.Logf(1000, "账号 %s@%s 校验通过", p.UserName, p.Host)
 		return nil
