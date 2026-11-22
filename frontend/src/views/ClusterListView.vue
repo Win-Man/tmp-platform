@@ -374,6 +374,9 @@ const enums = useEnumStore()
 /** 提示过一次之后不再重复弹（避免 URL 同步导致组件重挂载时反复提示）。 */
 let takeoverHinted = false
 
+/** 批量采集失败提示里最多列出几个集群，超出的折叠成「其余 N 个略」。 */
+const FAIL_DETAIL_LIMIT = 3
+
 const loading = ref(false)
 const rows = ref<ClusterBrief[]>([])
 const total = ref(0)
@@ -724,9 +727,50 @@ async function batchRefresh(): Promise<void> {
     ElMessage.warning('请选择要采集的集群')
     return
   }
+  // 服务端返回 { results: [...] }（每个集群一条，失败项 jobId=0 且带 error），
+  // 不是裸数组；历史实现按 res.length 取数会拿到 undefined。
   const res = await clusterApi.batchRefresh(ids)
-  ElMessage.success(`已提交 ${res.length} 个采集任务`)
+  if (!Array.isArray(res?.results)) {
+    // 返回体结构与约定不符时不要静默，否则又会退化成「已提交 0 个」这类误导文案。
+    // 但后端可能已经受理了任务，先刷新列表把真实的采集状态拉回来，别让界面停在旧状态。
+    ElMessage.error('批量采集返回格式异常，请刷新列表确认采集状态')
+    await load()
+    return
+  }
+  const results = res.results
+  // 分区用「取反」而不是 jobId <= 0：jobId 缺失（undefined）时 "<= 0" 为 false，
+  // 这条结果会同时漏出两个桶；互补的过滤条件保证每条结果必然落进其中一个。
+  const okItems = results.filter((item) => item.jobId > 0)
+  const failedItems = results.filter((item) => !(item.jobId > 0))
+  const reusedCount = okItems.filter((item) => item.reused).length
+
+  if (results.length === 0) {
+    ElMessage.warning('没有可提交的采集任务')
+  } else if (failedItems.length === 0) {
+    const suffix = reusedCount > 0 ? `（其中 ${reusedCount} 个复用了进行中的任务）` : ''
+    ElMessage.success(`已提交 ${okItems.length} 个采集任务${suffix}`)
+  } else {
+    // 失败明细最多列 3 个集群：一次勾选几十个时全量拼接会把 toast 撑满，反而看不清。
+    const shown = failedItems.slice(0, FAIL_DETAIL_LIMIT)
+    const detail = shown
+      .map((item) => `${clusterNameOf(item.clusterId)}（${item.error || '提交失败'}）`)
+      .join('；')
+    const rest = failedItems.length - shown.length
+    const head =
+      okItems.length > 0
+        ? `已提交 ${okItems.length} 个采集任务，${failedItems.length} 个失败`
+        : `${failedItems.length} 个采集任务均未提交成功`
+    ElMessage.warning({
+      message: `${head}：${detail}${rest > 0 ? `（其余 ${rest} 个略）` : ''}`,
+      duration: 6000,
+    })
+  }
   await load()
+}
+
+/** 批量结果里的集群名：优先取当前列表（名字用肉眼可读），取不到退回 #id。 */
+function clusterNameOf(id: number): string {
+  return rows.value.find((row) => row.id === id)?.name || `#${id}`
 }
 
 function openRemove(row: ClusterBrief): void {

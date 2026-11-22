@@ -166,6 +166,13 @@ export interface RefreshResult {
   clusterId: number
   jobId: number
   reused?: boolean
+  /** 批量提交时该集群的失败原因；jobId 为 0 表示未提交成功。 */
+  error?: string
+}
+
+/** 批量采集返回体：服务端包装成 { results: [...] }，不是裸数组。 */
+export interface BatchRefreshResult {
+  results: RefreshResult[]
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +249,7 @@ export const clusterApi = {
     request<null>({ url: `/clusters/${id}`, method: 'delete', data: { confirmName } }),
   refresh: (id: number) => request<RefreshResult>({ url: `/clusters/${id}/refresh`, method: 'post' }),
   batchRefresh: (ids: number[]) =>
-    request<RefreshResult[]>({ url: '/clusters/batch-refresh', method: 'post', data: { ids } }),
+    request<BatchRefreshResult>({ url: '/clusters/batch-refresh', method: 'post', data: { ids } }),
   overview: (id: number) => request<ClusterOverview>({ url: `/clusters/${id}/overview`, method: 'get' }),
   topology: (id: number) => request<TopologyResult>({ url: `/clusters/${id}/topology`, method: 'get' }),
   instances: (id: number, params: Record<string, unknown>) =>
@@ -260,7 +267,8 @@ export const clusterApi = {
     request<{ list: JobRow[] }>({ url: `/clusters/${id}/jobs`, method: 'get', params: { limit } }),
   metrics: (id: number, range: string) =>
     request<unknown>({ url: `/clusters/${id}/metrics`, method: 'get', params: { range } }),
-  alerts: (id: number) => request<{ list: unknown[] }>({ url: `/clusters/${id}/alerts`, method: 'get' }),
+  /** 告警列表：后端直接返回裸数组（OK(c, list)），不套 { list } 包装。 */
+  alerts: (id: number) => request<unknown[]>({ url: `/clusters/${id}/alerts`, method: 'get' }),
 }
 
 // ---------------------------------------------------------------------------

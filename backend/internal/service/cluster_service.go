@@ -988,6 +988,9 @@ type RefreshResult struct {
 	ClusterID int64 `json:"clusterId"`
 	JobID     int64 `json:"jobId"`
 	Reused    bool  `json:"reused"`
+	// Error 批量提交时单个集群的失败原因；单集群接口失败走 error 响应，不填该字段。
+	// 批量接口整体仍返回 202，由前端按 jobId==0 + Error 展示哪些集群没提交成功。
+	Error string `json:"error,omitempty"`
 }
 
 // Refresh 手动刷新采集；已有进行中任务则复用。
@@ -1038,12 +1041,24 @@ func (s *ClusterService) BatchRefresh(ctx context.Context, ids []int64, operator
 	for _, id := range ids {
 		res, err := s.Refresh(ctx, id, operator)
 		if err != nil {
-			out = append(out, RefreshResult{ClusterID: id, JobID: 0})
+			// 单个集群失败不拖垮整批：带上原因返回，前端据此提示「哪几个没提交成功」。
+			out = append(out, RefreshResult{ClusterID: id, Error: failureReason(err)})
 			continue
 		}
 		out = append(out, *res)
 	}
 	return out, nil
+}
+
+// failureReason 把批量提交的单条失败归一为可展示文案。
+// 只透出领域错误（apperr）的 Message；其余（如 engine.Submit 透传的底层错误）
+// 一律收敛为固定文案，避免 DB/网络细节漏到前端。
+func failureReason(err error) string {
+	var ae *apperr.Error
+	if errors.As(err, &ae) {
+		return ae.Message
+	}
+	return "提交失败"
 }
 
 // operatorName 操作者展示名。
