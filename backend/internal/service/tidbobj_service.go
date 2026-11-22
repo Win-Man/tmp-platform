@@ -387,6 +387,229 @@ func (s *TiDBObjService) ListResourceGroups(ctx context.Context, clusterID int64
 	return list, nil
 }
 
+// RefreshResourceGroups 实时查询 information_schema.resource_groups 并写回快照。
+//
+// Resource Group 是会被平台新建 / 修改 / 删除的对象，快照表只反映「上次采集」那一刻；
+// 「刷新」走这条路径：直接连库读当前 resource_groups，再把结果写回 resource_groups 表，
+// 使新建 / 修改 / 删除后的最新状态立即可见。
+func (s *TiDBObjService) RefreshResourceGroups(ctx context.Context, clusterID int64) ([]model.ResourceGroup, error) {
+	c, err := s.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return nil, apperr.NotFound("集群不存在")
+	}
+	if err := s.ensureRGSupported(c); err != nil {
+		return nil, err
+	}
+	if s.mode.IsMock() {
+		// 演示模式没有真实数据库可连，回放快照，避免页面直接报错。
+		return s.ListResourceGroups(ctx, clusterID)
+	}
+	_, t, err := s.target(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, collector.ChannelTimeout)
+	defer cancel()
+	rows, ferr := collector.NewMySQLChannel(collector.ChannelTimeout).FetchResourceGroups(cctx, t)
+	if ferr != nil {
+		return nil, apperr.CollectFailed("实时查询 Resource Group 失败", map[string]any{
+			"reason": firstLine(ferr.Error()),
+		})
+	}
+
+	now := time.Now()
+	list := make([]model.ResourceGroup, 0, len(rows))
+	for _, r := range rows {
+		b := 0
+		if r.Burstable {
+			b = 1
+		}
+		list = append(list, model.ResourceGroup{
+			ClusterID: clusterID,
+			Name:      r.Name,
+			RUPerSec:  r.RUPerSec,
+			Priority:  r.Priority,
+			Burstable: b,
+			UserCount: r.UserCount,
+			Status:    r.Status,
+			FetchedAt: now,
+			CreatedAt: now,
+		})
+	}
+	// 写回快照（尽力而为）：失败不影响本次返回，下次采集会覆盖。
+	_ = s.obj.ReplaceResourceGroups(ctx, clusterID, list)
+	return list, nil
+}
+
+// RGPriority 允许的 Resource Group 绝对优先级枚举。
+var rgPriorities = map[string]bool{"LOW": true, "MEDIUM": true, "HIGH": true}
+
+// rgName 校验 Resource Group 名称并返回反引号包裹的安全形式。
+func rgName(name string) (string, error) {
+	if name == "" {
+		return "", apperr.BadRequest("Resource Group 名称不能为空")
+	}
+	q, err := sqlsafe.Ident(name)
+	if err != nil {
+		return "", apperr.BadRequest("Resource Group 名称不合法：仅允许字母、数字、下划线，1~64 位")
+	}
+	return q, nil
+}
+
+// rgRuPerSec 校验 RU_PER_SEC（非负整数，0 表示不限速）。
+func rgRuPerSec(v string) (string, error) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "", apperr.BadRequest("RU_PER_SEC 不能为空")
+	}
+	if !isNonNegInt(s) {
+		return "", apperr.BadRequest("RU_PER_SEC 必须为非负整数")
+	}
+	return s, nil
+}
+
+// isNonNegInt 判断字符串是否为非负整数。
+func isNonNegInt(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// rgClause 构造 RU_PER_SEC / PRIORITY / BURSTABLE 的 SQL 片段。
+//
+// 名称已通过 sqlsafe.Ident 校验为反引号包裹形式；RU_PER_SEC 与 PRIORITY 均经过
+// 白名单校验，BURSTABLE 为固定关键字，不拼接任何用户自由文本。
+//
+// alter 区分场景：CREATE 时 burstable=false 表示「不开启」直接省略关键字；
+// ALTER 时 burstable=false 必须显式输出 BURSTABLE = FALSE，否则增量语义会
+// 保持原值不变（导致「关闭」无效）。两者均为白名单固定文本，无注入风险。
+func rgClause(name, ruPerSec, priority string, burstable bool, alter bool) (string, error) {
+	ident, err := rgName(name)
+	if err != nil {
+		return "", err
+	}
+	ru, err := rgRuPerSec(ruPerSec)
+	if err != nil {
+		return "", err
+	}
+	sb := strings.Builder{}
+	sb.WriteString(ident)
+	sb.WriteString(" RU_PER_SEC = ")
+	sb.WriteString(ru)
+	if p := strings.ToUpper(strings.TrimSpace(priority)); p != "" {
+		if !rgPriorities[p] {
+			return "", apperr.BadRequest("PRIORITY 仅支持 LOW / MEDIUM / HIGH")
+		}
+		sb.WriteString(" PRIORITY = ")
+		sb.WriteString(p)
+	}
+	if burstable {
+		sb.WriteString(" BURSTABLE")
+	} else if alter {
+		sb.WriteString(" BURSTABLE = FALSE")
+	}
+	return sb.String(), nil
+}
+
+// CreateResourceGroupInput 新建 Resource Group 入参。
+type CreateResourceGroupInput struct {
+	Name      string `json:"name"`
+	RUPerSec  string `json:"ruPerSec"`
+	Priority  string `json:"priority"`
+	Burstable bool   `json:"burstable"`
+}
+
+// AlterResourceGroupInput 修改 Resource Group 入参。
+type AlterResourceGroupInput struct {
+	RUPerSec  string `json:"ruPerSec"`
+	Priority  string `json:"priority"`
+	Burstable bool   `json:"burstable"`
+}
+
+// CreateResourceGroup 新建 Resource Group（同步执行）。
+func (s *TiDBObjService) CreateResourceGroup(ctx context.Context, clusterID int64, in CreateResourceGroupInput) error {
+	c, err := s.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return apperr.NotFound("集群不存在")
+	}
+	if err := s.ensureRGSupported(c); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(in.Name), "default") {
+		return apperr.Conflict("default 为系统内置资源组，无法重复创建")
+	}
+	clause, err := rgClause(in.Name, in.RUPerSec, in.Priority, in.Burstable, false)
+	if err != nil {
+		return err
+	}
+	_, target, terr := s.target(ctx, clusterID)
+	if terr != nil {
+		return terr
+	}
+	stmt := fmt.Sprintf("CREATE RESOURCE GROUP %s", clause)
+	if xerr := s.mode.Current().Exec(ctx, target, collector.Statement{SQL: stmt}); xerr != nil {
+		return apperr.CollectFailed("创建 Resource Group 失败: "+xerr.Error(), nil)
+	}
+	return nil
+}
+
+// AlterResourceGroup 修改 Resource Group（同步执行，仅支持 RU_PER_SEC / PRIORITY / BURSTABLE）。
+func (s *TiDBObjService) AlterResourceGroup(ctx context.Context, clusterID int64, name string, in AlterResourceGroupInput) error {
+	c, err := s.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return apperr.NotFound("集群不存在")
+	}
+	if err := s.ensureRGSupported(c); err != nil {
+		return err
+	}
+	clause, err := rgClause(name, in.RUPerSec, in.Priority, in.Burstable, true)
+	if err != nil {
+		return err
+	}
+	_, target, terr := s.target(ctx, clusterID)
+	if terr != nil {
+		return terr
+	}
+	stmt := fmt.Sprintf("ALTER RESOURCE GROUP %s", clause)
+	if xerr := s.mode.Current().Exec(ctx, target, collector.Statement{SQL: stmt}); xerr != nil {
+		return apperr.CollectFailed("修改 Resource Group 失败: "+xerr.Error(), nil)
+	}
+	return nil
+}
+
+// DeleteResourceGroup 删除 Resource Group（同步执行，default 受保护）。
+func (s *TiDBObjService) DeleteResourceGroup(ctx context.Context, clusterID int64, name string) error {
+	c, err := s.clusters.GetByID(ctx, clusterID)
+	if err != nil {
+		return apperr.NotFound("集群不存在")
+	}
+	if err := s.ensureRGSupported(c); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(name), "default") {
+		return apperr.Forbidden("default 为系统内置资源组，不允许删除")
+	}
+	ident, err := rgName(name)
+	if err != nil {
+		return err
+	}
+	_, target, terr := s.target(ctx, clusterID)
+	if terr != nil {
+		return terr
+	}
+	stmt := fmt.Sprintf("DROP RESOURCE GROUP %s", ident)
+	if xerr := s.mode.Current().Exec(ctx, target, collector.Statement{SQL: stmt}); xerr != nil {
+		return apperr.CollectFailed("删除 Resource Group 失败: "+xerr.Error(), nil)
+	}
+	return nil
+}
+
 // BindRGInput RG 绑定 / 解绑入参。
 type BindRGInput struct {
 	UserName      string `json:"userName"`

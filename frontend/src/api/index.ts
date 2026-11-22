@@ -304,6 +304,27 @@ export const tidbApi = {
     }),
   resourceGroups: (id: number) =>
     request<{ list: ResourceGroupRow[] }>({ url: `/clusters/${id}/resource-groups`, method: 'get' }),
+  /** 实时查询 information_schema.resource_groups（silent=true 时不弹全局错误条，由页面兜底提示）。 */
+  refreshResourceGroups: (id: number, silent = false) =>
+    request<{ list: ResourceGroupRow[] }>({
+      url: `/clusters/${id}/resource-groups`,
+      method: 'get',
+      params: { live: 1 },
+      headers: silent ? { 'X-TMP-Silent': '1' } : undefined,
+    }),
+  createRG: (id: number, data: { name: string; ruPerSec: string; priority?: string; burstable: boolean }) =>
+    request<null>({ url: `/clusters/${id}/resource-groups`, method: 'post', data }),
+  updateRG: (id: number, name: string, data: { ruPerSec: string; priority?: string; burstable: boolean }) =>
+    request<null>({
+      url: `/clusters/${id}/resource-groups/${encodeURIComponent(name)}`,
+      method: 'put',
+      data,
+    }),
+  deleteRG: (id: number, name: string) =>
+    request<null>({
+      url: `/clusters/${id}/resource-groups/${encodeURIComponent(name)}`,
+      method: 'delete',
+    }),
   bindRG: (id: number, data: { userName: string; host: string; resourceGroup: string }) =>
     request<null>({ url: `/clusters/${id}/resource-groups/bind`, method: 'post', data }),
   unbindRG: (id: number, data: { userName: string; host: string }) =>

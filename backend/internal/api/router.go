@@ -118,6 +118,9 @@ func NewRouter(d RouterDeps) *gin.Engine {
 		authed.DELETE("/clusters/:id/tidb-users/:uid/grants", auth.Require(auth.ActionTiDBUserGrant), h.RevokeTiDBUserGrants)
 
 		authed.GET("/clusters/:id/resource-groups", auth.Require(auth.ActionRGView), h.ListResourceGroups)
+		authed.POST("/clusters/:id/resource-groups", auth.Require(auth.ActionRGManage), h.CreateResourceGroup)
+		authed.PUT("/clusters/:id/resource-groups/:name", auth.Require(auth.ActionRGManage), h.AlterResourceGroup)
+		authed.DELETE("/clusters/:id/resource-groups/:name", auth.Require(auth.ActionRGManage), h.DeleteResourceGroup)
 		authed.POST("/clusters/:id/resource-groups/bind", auth.Require(auth.ActionRGBind), h.BindResourceGroup)
 		authed.POST("/clusters/:id/resource-groups/unbind", auth.Require(auth.ActionRGBind), h.UnbindResourceGroup)
 

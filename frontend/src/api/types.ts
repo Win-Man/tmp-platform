@@ -192,10 +192,11 @@ export interface ResourceGroupRow {
   id: number
   clusterId: number
   name: string
-  mode?: string
-  cpuCount?: number
-  ruPerSec?: number
-  burstable?: string
+  ruPerSec?: string
+  priority?: string
+  burstable?: number
+  userCount?: number
+  status?: string
   fetchedAt?: string
 }
 

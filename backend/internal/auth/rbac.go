@@ -28,8 +28,9 @@ const (
 	ActionTiDBUserPassword Action = "tidb_user.password"
 	ActionTiDBUserGrant    Action = "tidb_user.grant"
 
-	ActionRGView Action = "resource_group.view"
-	ActionRGBind Action = "resource_group.bind"
+	ActionRGView   Action = "resource_group.view"
+	ActionRGBind   Action = "resource_group.bind"
+	ActionRGManage Action = "resource_group.manage"
 
 	ActionSessionView Action = "session.view"
 	ActionSessionKill Action = "session.kill"
@@ -113,6 +114,7 @@ func writeActions() []Action {
 		ActionTiDBUserPassword,
 		ActionTiDBUserGrant,
 		ActionRGBind,
+		ActionRGManage,
 		ActionSessionKill,
 		ActionVariableUpdate,
 		ActionInspectRun,
@@ -217,6 +219,7 @@ func Matrix() []ActionDef {
 		{ActionTiDBUserPassword, "重置 TiDB 用户密码", "TiDB 对象", true, true, false},
 		{ActionTiDBUserGrant, "授予 / 回收权限", "TiDB 对象", true, true, false},
 		{ActionRGBind, "Resource Group 绑定 / 解绑", "TiDB 对象", true, true, false},
+		{ActionRGManage, "Resource Group 新建 / 修改 / 删除", "TiDB 对象", true, true, false},
 		{ActionSessionKill, "Kill 会话", "TiDB 对象", true, true, false},
 		{ActionVariableUpdate, "修改全局变量（白名单）", "TiDB 对象", true, true, false},
 

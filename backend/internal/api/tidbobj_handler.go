@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/gin-gonic/gin"
 
+	"github.com/tmp-platform/backend/internal/model"
 	"github.com/tmp-platform/backend/internal/repo"
 	"github.com/tmp-platform/backend/internal/service"
 )
@@ -147,17 +148,85 @@ func (h *Handlers) changeGrants(c *gin.Context, grant bool) {
 }
 
 // ListResourceGroups GET /api/v1/clusters/:id/resource-groups
+//
+// live=1 时实时查询 information_schema.resource_groups（页面刷新按钮），
+// 否则读取上次采集的 Resource Group 快照。
 func (h *Handlers) ListResourceGroups(c *gin.Context) {
 	id, ok := Int64Param(c, "id")
 	if !ok {
 		return
 	}
-	list, err := h.TiDBObj.ListResourceGroups(c.Request.Context(), id)
+	var list []model.ResourceGroup
+	var err error
+	if BoolQuery(c, "live") {
+		list, err = h.TiDBObj.RefreshResourceGroups(c.Request.Context(), id)
+	} else {
+		list, err = h.TiDBObj.ListResourceGroups(c.Request.Context(), id)
+	}
 	if err != nil {
 		Fail(c, err)
 		return
 	}
 	OK(c, gin.H{"list": list})
+}
+
+// CreateResourceGroup POST /api/v1/clusters/:id/resource-groups
+func (h *Handlers) CreateResourceGroup(c *gin.Context) {
+	id, ok := Int64Param(c, "id")
+	if !ok {
+		return
+	}
+	var in service.CreateResourceGroupInput
+	if !BindJSON(c, &in) {
+		return
+	}
+	if err := h.TiDBObj.CreateResourceGroup(c.Request.Context(), id, in); err != nil {
+		h.RecordAudit(c, service.AuditRGCreate, "resource_group", "", in.Name, "failed", map[string]any{"error": err.Error()})
+		Fail(c, err)
+		return
+	}
+	h.RecordAudit(c, service.AuditRGCreate, "resource_group", "", in.Name, "success", map[string]any{
+		"ruPerSec": in.RUPerSec, "priority": in.Priority, "burstable": in.Burstable,
+	})
+	NoContent(c)
+}
+
+// AlterResourceGroup PUT /api/v1/clusters/:id/resource-groups/:name
+func (h *Handlers) AlterResourceGroup(c *gin.Context) {
+	id, ok := Int64Param(c, "id")
+	if !ok {
+		return
+	}
+	name := c.Param("name")
+	var in service.AlterResourceGroupInput
+	if !BindJSON(c, &in) {
+		return
+	}
+	if err := h.TiDBObj.AlterResourceGroup(c.Request.Context(), id, name, in); err != nil {
+		h.RecordAudit(c, service.AuditRGAlter, "resource_group", "", name, "failed", map[string]any{"error": err.Error()})
+		Fail(c, err)
+		return
+	}
+	h.RecordAudit(c, service.AuditRGAlter, "resource_group", "", name, "success", map[string]any{
+		"ruPerSec": in.RUPerSec, "priority": in.Priority, "burstable": in.Burstable,
+	})
+	NoContent(c)
+}
+
+// DeleteResourceGroup DELETE /api/v1/clusters/:id/resource-groups/:name
+func (h *Handlers) DeleteResourceGroup(c *gin.Context) {
+	id, ok := Int64Param(c, "id")
+	if !ok {
+		return
+	}
+	name := c.Param("name")
+	if err := h.TiDBObj.DeleteResourceGroup(c.Request.Context(), id, name); err != nil {
+		h.RecordAudit(c, service.AuditRGDrop, "resource_group", "", name, "failed", map[string]any{"error": err.Error()})
+		Fail(c, err)
+		return
+	}
+	h.RecordAudit(c, service.AuditRGDrop, "resource_group", "", name, "success", nil)
+	NoContent(c)
 }
 
 // BindResourceGroup POST /api/v1/clusters/:id/resource-groups/bind

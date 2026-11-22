@@ -188,6 +188,25 @@ func (r *TiDBObjRepo) ListResourceGroups(ctx context.Context, clusterID int64) (
 	return list, err
 }
 
+// ReplaceResourceGroups 用实时结果整体替换某集群的 Resource Group 缓存。
+//
+// 与 ReplaceSessions / ReplaceVariables 同理：只动 resource_groups 表，
+// 让「Resource Group」页刷新后能立刻看到新建 / 修改 / 删除的结果。
+func (r *TiDBObjRepo) ReplaceResourceGroups(ctx context.Context, clusterID int64, list []model.ResourceGroup) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("cluster_id = ?", clusterID).Delete(&model.ResourceGroup{}).Error; err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			return nil
+		}
+		for i := range list {
+			list[i].ClusterID = clusterID
+		}
+		return tx.CreateInBatches(list, 100).Error
+	})
+}
+
 // CountUsersByResourceGroup 统计绑定到某 RG 的用户数。
 func (r *TiDBObjRepo) CountUsersByResourceGroup(ctx context.Context, clusterID int64, rg string) (int64, error) {
 	var n int64
