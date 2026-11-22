@@ -193,10 +193,14 @@ func (c *mysqlChannel) FetchUsers(ctx context.Context, t *Target) ([]TiDBUserRow
 	return out, nil
 }
 
-// FetchVariables 读取全局变量及其默认值。
+// FetchVariables 读取全局变量、默认值与作用域。
 //
-// 实现方式：SHOW GLOBAL VARIABLES 取当前值，再与 information_schema.cluster_config
-// 的默认值合并，从而不依赖 TiDB 版本是否提供 variables_info 表。
+// 实现方式：SHOW GLOBAL VARIABLES 取当前值（所有版本都有），
+// 再用 information_schema.variables_info 补默认值与作用域。
+// 注意不要用 information_schema.cluster_config 当默认值来源：它只有
+// TYPE/INSTANCE/KEY/VALUE 四列，且 KEY 是配置文件键名（mem-quota-query），
+// 与系统变量名（tidb_mem_quota_query）对不上，早年按此实现导致默认值恒为空、
+// 「仅看差异」永远 0 条。
 func (c *mysqlChannel) FetchVariables(ctx context.Context, t *Target) ([]VariableRow, error) {
 	db, err := c.open(ctx, t)
 	if err != nil {
@@ -208,26 +212,34 @@ func (c *mysqlChannel) FetchVariables(ctx context.Context, t *Target) ([]Variabl
 	if err != nil {
 		return nil, err
 	}
-	defaults := map[string]string{}
-	if cfgRows, cfgErr := c.queryMaps(ctx, db,
-		"SELECT VARIABLE_NAME, DEFAULT_VALUE FROM information_schema.cluster_config WHERE TYPE='tidb'"); cfgErr == nil {
-		for _, r := range cfgRows {
-			defaults[getStr(r, "variable_name")] = getStr(r, "default_value")
+	// 默认值 / 作用域（v6.5+ 提供；老版本查不到就退化为空默认值）。
+	meta := map[string]VariableRow{}
+	if info, ierr := c.queryMaps(ctx, db,
+		"SELECT VARIABLE_NAME, VARIABLE_SCOPE, DEFAULT_VALUE FROM information_schema.variables_info"); ierr == nil {
+		for _, r := range info {
+			name := getStr(r, "variable_name")
+			if name == "" {
+				continue
+			}
+			meta[name] = VariableRow{
+				DefaultValue: getStr(r, "default_value"),
+				Scope:        normalizeScope(getStr(r, "variable_scope")),
+			}
 		}
 	}
 	out := make([]VariableRow, 0, len(rows))
 	for _, r := range rows {
 		name := getStr(r, "variable_name")
 		value := getStr(r, "value")
-		dv, hasDefault := defaults[name]
-		scope := "both"
-		if !hasDefault {
-			scope = "global"
+		m := meta[name]
+		scope := m.Scope
+		if scope == "" {
+			scope = "both"
 		}
 		out = append(out, VariableRow{
 			Name:         name,
 			Value:        value,
-			DefaultValue: dv,
+			DefaultValue: m.DefaultValue,
 			Scope:        scope,
 			IsDynamic:    true,
 			Description:  "",
@@ -236,12 +248,32 @@ func (c *mysqlChannel) FetchVariables(ctx context.Context, t *Target) ([]Variabl
 	return out, nil
 }
 
+// normalizeScope 把 variables_info 的 VARIABLE_SCOPE 归一到前端使用的作用域取值。
+func normalizeScope(v string) string {
+	s := strings.ToUpper(strings.TrimSpace(v))
+	switch {
+	case s == "":
+		return ""
+	case strings.Contains(s, "GLOBAL") && strings.Contains(s, "SESSION"):
+		return "both"
+	case strings.Contains(s, "GLOBAL"):
+		return "global"
+	case strings.Contains(s, "SESSION"):
+		return "session"
+	}
+	return "both"
+}
+
 // FetchSessions 读取集群级 processlist。
 //
 // 首选 information_schema.cluster_processlist：一次查询覆盖所有 TiDB 实例，
 // 并带 INSTANCE 列（形如 10.10.10.10:4000），这是「会话」页面的权威来源。
 // 该表需要 PROCESS 权限、且由 TiDB 4.0+ 提供；失败时退回只覆盖当前实例的
 // information_schema.processlist，用连接地址兜底 INSTANCE。
+//
+// 同时取 INFO（SQL 原文）与 DIGEST（SQL 指纹）：DIGEST 是 TiDB 6.0 之后
+// 才有的列，老版本查询会报 unknown column，因此按「带 DIGEST → 不带 DIGEST」
+// 回退，保证新老版本都能采到会话。
 func (c *mysqlChannel) FetchSessions(ctx context.Context, t *Target) ([]SessionRow, error) {
 	db, err := c.open(ctx, t)
 	if err != nil {
@@ -271,25 +303,35 @@ func (c *mysqlChannel) FetchSessions(ctx context.Context, t *Target) ([]SessionR
 			Command:   getStr(r, "command"),
 			TimeSec:   tsec,
 			State:     getStr(r, "state"),
-			SQLDigest: truncateRunes(getStr(r, "info"), 200),
+			SQLText:   truncateRunes(getStr(r, "info"), 200),
+			SQLDigest: truncateRunes(getStr(r, "digest"), 200),
 		})
 	}
 	return out, nil
 }
 
-// sessionRows 依次尝试 cluster_processlist → processlist。
+// sessionRows 依次尝试 cluster_processlist（带/不带 DIGEST）→ processlist（带/不带 DIGEST）。
+//
+// 返回的 bool 表示是否来自集群级视图（决定 INSTANCE 列是否存在）。
 func (c *mysqlChannel) sessionRows(ctx context.Context, db *sql.DB) ([]map[string]string, bool, error) {
-	rows, err := c.queryMaps(ctx, db,
-		"SELECT INSTANCE, ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.cluster_processlist")
-	if err == nil {
-		return rows, true, nil
+	candidates := []struct {
+		sql     string
+		cluster bool
+	}{
+		{"SELECT INSTANCE, ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO, DIGEST FROM information_schema.cluster_processlist", true},
+		{"SELECT INSTANCE, ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.cluster_processlist", true},
+		{"SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO, DIGEST FROM information_schema.processlist", false},
+		{"SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.processlist", false},
 	}
-	fallback, ferr := c.queryMaps(ctx, db,
-		"SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.processlist")
-	if ferr != nil {
-		return nil, false, ferr
+	var lastErr error
+	for _, cand := range candidates {
+		rows, err := c.queryMaps(ctx, db, cand.sql)
+		if err == nil {
+			return rows, cand.cluster, nil
+		}
+		lastErr = err
 	}
-	return fallback, false, nil
+	return nil, false, lastErr
 }
 
 // effectivePort 返回实际连接的端口（默认 4000）。

@@ -67,8 +67,16 @@
         </template>
       </el-table-column>
       <el-table-column prop="state" label="状态" width="120" />
-      <el-table-column label="SQL" min-width="280">
-        <template #default="{ row }"><span class="mono">{{ row.sqlDigest || '—' }}</span></template>
+      <el-table-column label="SQL" min-width="260" show-overflow-tooltip>
+        <template #default="{ row }"><span class="mono">{{ row.sqlText || '—' }}</span></template>
+      </el-table-column>
+      <el-table-column label="DIGEST" min-width="240">
+        <template #default="{ row }">
+          <el-tooltip v-if="row.sqlDigest" :content="row.sqlDigest" placement="top">
+            <span class="mono digest-cell">{{ row.sqlDigest }}</span>
+          </el-tooltip>
+          <span v-else class="text-muted">—</span>
+        </template>
       </el-table-column>
     </el-table>
 
@@ -199,5 +207,17 @@ onMounted(() => {
   margin: -4px 0 8px;
   font-size: 12px;
   line-height: 18px;
+}
+
+/* 32 位十六进制指纹，等宽 + 单行省略，悬浮看完整值。 */
+.digest-cell {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 </style>

@@ -23,6 +23,9 @@ func NewJobService(jobs *repo.JobRepo) *JobService { return &JobService{jobs: jo
 // SetEngine 注入任务引擎。
 func (s *JobService) SetEngine(e *job.Engine) { s.engine = e }
 
+// EngineBound 报告任务引擎是否已注入。
+func (s *JobService) EngineBound() bool { return s.engine != nil }
+
 // JobView 任务视图（补充类型展示名）。
 type JobView struct {
 	model.Job

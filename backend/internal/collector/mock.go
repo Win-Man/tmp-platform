@@ -350,10 +350,10 @@ func fixtureProdA() *mockFixture {
 			"tidb_scatter_region":           "ON",
 		}),
 		sessions: []SessionRow{
-			{ID: 10501, Instance: "10.20.1.11:4000", UserName: "app_order", Host: "10.20.5.31:52344", DB: "order_db", Command: "Query", TimeSec: 182, State: "statistics", SQLDigest: "SELECT o.id, o.amount FROM orders o JOIN order_item i ON o.id=i.order_id WHERE o.created_at > ?"},
-			{ID: 10502, Instance: "10.20.1.11:4000", UserName: "app_pay", Host: "10.20.5.32:41120", DB: "pay_db", Command: "Sleep", TimeSec: 12, State: "", SQLDigest: ""},
-			{ID: 10503, Instance: "10.20.1.12:4000", UserName: "readonly_bi", Host: "10.20.6.7:33022", DB: "dw", Command: "Query", TimeSec: 75, State: "coprocessor", SQLDigest: "SELECT count(*) FROM fact_trade WHERE dt = ?"},
-			{ID: 10504, Instance: "10.20.1.12:4000", UserName: "app_order", Host: "10.20.5.33:39210", DB: "order_db", Command: "Query", TimeSec: 3, State: "autocommit", SQLDigest: "INSERT INTO order_log (id, msg) VALUES (?, ?)"},
+			{ID: 10501, Instance: "10.20.1.11:4000", UserName: "app_order", Host: "10.20.5.31:52344", DB: "order_db", Command: "Query", TimeSec: 182, State: "statistics", SQLText: "SELECT o.id, o.amount FROM orders o JOIN order_item i ON o.id=i.order_id WHERE o.created_at > ?", SQLDigest: "8f1a2c4e6b9d0a3f5c7e1b2d4a6f8c0e1b3d5a7c9e0f2b4d6a8c0e2f4b6d8a0c"},
+			{ID: 10502, Instance: "10.20.1.11:4000", UserName: "app_pay", Host: "10.20.5.32:41120", DB: "pay_db", Command: "Sleep", TimeSec: 12, State: "", SQLText: "", SQLDigest: ""},
+			{ID: 10503, Instance: "10.20.1.12:4000", UserName: "readonly_bi", Host: "10.20.6.7:33022", DB: "dw", Command: "Query", TimeSec: 75, State: "coprocessor", SQLText: "SELECT count(*) FROM fact_trade WHERE dt = ?", SQLDigest: "b7e2d9c4a1f60b8e3d5c7a9f1b2e4d6c8a0f1b3d5e7c9a2b4d6f8e0c2a4b6d8f"},
+			{ID: 10504, Instance: "10.20.1.12:4000", UserName: "app_order", Host: "10.20.5.33:39210", DB: "order_db", Command: "Query", TimeSec: 3, State: "autocommit", SQLText: "INSERT INTO order_log (id, msg) VALUES (?, ?)", SQLDigest: "c4a8e0f2b6d1a3c5e7f9b0d2a4c6e8f0b1d3a5c7e9f0b2d4a6c8e0f1b3d5a7c9"},
 		},
 		rgs: []RGRow{
 			{Name: "default", RUPerSec: "UNLIMITED", Priority: "MEDIUM", Burstable: false, UserCount: 4, Status: "running"},
@@ -394,8 +394,8 @@ func fixtureProdB() *mockFixture {
 			"tidb_enable_async_commit": "OFF",
 		}),
 		sessions: []SessionRow{
-			{ID: 2401, Instance: "10.30.2.21:4000", UserName: "app_crm", Host: "10.30.9.11:51022", DB: "crm", Command: "Query", TimeSec: 320, State: "coprocessor", SQLDigest: "SELECT * FROM customer WHERE phone LIKE ?"},
-			{ID: 2402, Instance: "10.30.2.21:4000", UserName: "report_user", Host: "10.30.9.12:41880", DB: "crm", Command: "Sleep", TimeSec: 5, State: "", SQLDigest: ""},
+			{ID: 2401, Instance: "10.30.2.21:4000", UserName: "app_crm", Host: "10.30.9.11:51022", DB: "crm", Command: "Query", TimeSec: 320, State: "coprocessor", SQLText: "SELECT * FROM customer WHERE phone LIKE ?", SQLDigest: "d5b9f1a3c7e0b2d4f6a8c0e1b3d5f7a9c2e4b6d8f0a1c3e5b7d9f1a2c4e6b8d0"},
+			{ID: 2402, Instance: "10.30.2.21:4000", UserName: "report_user", Host: "10.30.9.12:41880", DB: "crm", Command: "Sleep", TimeSec: 5, State: "", SQLText: "", SQLDigest: ""},
 		},
 		// v6.5 不提供 Resource Group，返回空集合。
 		rgs: nil,
@@ -430,7 +430,7 @@ func fixtureTestC() *mockFixture {
 			"tidb_server_memory_limit": "32GB",
 		}),
 		sessions: []SessionRow{
-			{ID: 3311, Instance: "10.40.3.31:4000", UserName: "tester", Host: "10.40.9.21:60122", DB: "test", Command: "Query", TimeSec: 91, State: "hashagg", SQLDigest: "SELECT /*+ hash_agg */ t.id, count(*) FROM t GROUP BY t.id"},
+			{ID: 3311, Instance: "10.40.3.31:4000", UserName: "tester", Host: "10.40.9.21:60122", DB: "test", Command: "Query", TimeSec: 91, State: "hashagg", SQLText: "SELECT /*+ hash_agg */ t.id, count(*) FROM t GROUP BY t.id", SQLDigest: "e6c0a2b4d8f1a3c5e7b9d0f2a4c6e8b1d3f5a7c9e0b2d4f6a8c1e3b5d7f9a0c2"},
 		},
 		rgs: []RGRow{
 			{Name: "default", RUPerSec: "UNLIMITED", Priority: "MEDIUM", Burstable: false, UserCount: 1, Status: "running"},

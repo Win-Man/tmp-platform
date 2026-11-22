@@ -54,6 +54,20 @@ func NewTiDBObjService(clusters *repo.ClusterRepo, creds *repo.CredentialRepo, o
 // SetEngine 注入任务引擎。
 func (s *TiDBObjService) SetEngine(e *job.Engine) { s.engine = e }
 
+// EngineBound 报告任务引擎是否已注入。
+func (s *TiDBObjService) EngineBound() bool { return s.engine != nil }
+
+// submit 提交异步任务。
+//
+// engine 由装配期注入（SetEngine）。这里显式判空：漏注入时给出可读错误，
+// 而不是在 engine 上做 nil 解引用直接 panic（历史上 Kill 会话因此报 500）。
+func (s *TiDBObjService) submit(ctx context.Context, j *model.Job) (int64, error) {
+	if s.engine == nil {
+		return 0, apperr.Internal("任务引擎未初始化")
+	}
+	return s.engine.Submit(ctx, j)
+}
+
 // target 构造采集目标。
 func (s *TiDBObjService) target(ctx context.Context, clusterID int64) (*model.Cluster, *collector.Target, error) {
 	c, err := s.clusters.GetByID(ctx, clusterID)
@@ -147,7 +161,7 @@ func (s *TiDBObjService) CreateUser(ctx context.Context, clusterID int64, in Cre
 	if operator != nil {
 		createdBy = &operator.ID
 	}
-	jobID, jerr := s.engine.Submit(ctx, &model.Job{
+	jobID, jerr := s.submit(ctx, &model.Job{
 		Type:          job.TypeCreateTiDBUser,
 		ClusterID:     &clusterID,
 		TargetType:    "tidb_user",
@@ -189,7 +203,7 @@ func (s *TiDBObjService) DeleteUser(ctx context.Context, clusterID, snapshotID i
 	if operator != nil {
 		createdBy = &operator.ID
 	}
-	jobID, jerr := s.engine.Submit(ctx, &model.Job{
+	jobID, jerr := s.submit(ctx, &model.Job{
 		Type:          job.TypeDropTiDBUser,
 		ClusterID:     &clusterID,
 		TargetType:    "tidb_user",
@@ -226,7 +240,7 @@ func (s *TiDBObjService) ResetPassword(ctx context.Context, clusterID, snapshotI
 	if operator != nil {
 		createdBy = &operator.ID
 	}
-	jobID, jerr := s.engine.Submit(ctx, &model.Job{
+	jobID, jerr := s.submit(ctx, &model.Job{
 		Type:          job.TypeResetTiDBPassword,
 		ClusterID:     &clusterID,
 		TargetType:    "tidb_user",
@@ -448,7 +462,7 @@ func (s *TiDBObjService) KillSessions(ctx context.Context, clusterID int64, sess
 	if operator != nil {
 		createdBy = &operator.ID
 	}
-	jobID, err := s.engine.Submit(ctx, &model.Job{
+	jobID, err := s.submit(ctx, &model.Job{
 		Type:          job.TypeKillSession,
 		ClusterID:     &clusterID,
 		TargetType:    "session",
@@ -542,6 +556,7 @@ func buildSessionPage(clusterID int64, rows []collector.SessionRow, f repo.Sessi
 			Command:   r.Command,
 			TimeSec:   r.TimeSec,
 			State:     r.State,
+			SQLText:   r.SQLText,
 			SQLDigest: r.SQLDigest,
 			FetchedAt: now,
 			CreatedAt: now,
@@ -566,9 +581,9 @@ func buildSessionPage(clusterID int64, rows []collector.SessionRow, f repo.Sessi
 	return filtered[start:end], total, filtered
 }
 
-// sessionMatches 会话关键词匹配：用户 / 来源 / 实例 / 库 / SQL。
+// sessionMatches 会话关键词匹配：用户 / 来源 / 实例 / 库 / SQL 原文 / SQL 指纹。
 func sessionMatches(r collector.SessionRow, kw string) bool {
-	for _, s := range []string{r.UserName, r.Host, r.Instance, r.DB, r.SQLDigest} {
+	for _, s := range []string{r.UserName, r.Host, r.Instance, r.DB, r.SQLText, r.SQLDigest} {
 		if s != "" && strings.Contains(strings.ToLower(s), kw) {
 			return true
 		}
@@ -600,6 +615,114 @@ func (s *TiDBObjService) ListVariables(ctx context.Context, clusterID int64, f r
 	}
 	res := repo.NewListResult(list, total, f.Page)
 	return &res, nil
+}
+
+// VariablesResult 参数列表结果（快照或实时同构）。
+type VariablesResult struct {
+	List      []model.Variable `json:"list"`
+	Total     int64            `json:"total"`
+	Page      int              `json:"page"`
+	PageSize  int              `json:"pageSize"`
+	Live      bool             `json:"live"`
+	Source    string           `json:"source"`
+	FetchedAt time.Time        `json:"fetchedAt"`
+}
+
+// RefreshVariables 实时读取全局参数（SHOW GLOBAL VARIABLES）。
+//
+// 参数与集群配置一样会被人随时改：页面「刷新」走这条路径，直接连库取当前值，
+// 过滤/排序/分页在内存完成，并顺手把结果写回 variables 表，
+// 使「仅看差异」统计、CSV 导出等仍基于最新数据。
+func (s *TiDBObjService) RefreshVariables(ctx context.Context, clusterID int64, f repo.VariableFilter) (*VariablesResult, error) {
+	if s.mode.IsMock() {
+		// 演示模式没有真实数据库可连，回放快照，避免页面直接报错。
+		snap, err := s.ListVariables(ctx, clusterID, f)
+		if err != nil {
+			return nil, err
+		}
+		return &VariablesResult{
+			List: snap.List, Total: snap.Total, Page: snap.Page, PageSize: snap.PageSize,
+			Source: "mock", FetchedAt: time.Now(),
+		}, nil
+	}
+	if _, err := s.clusters.GetByID(ctx, clusterID); err != nil {
+		return nil, apperr.NotFound("集群不存在")
+	}
+	_, t, err := s.target(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, collector.ChannelTimeout)
+	defer cancel()
+	rows, ferr := collector.NewMySQLChannel(collector.ChannelTimeout).FetchVariables(cctx, t)
+	if ferr != nil {
+		return nil, apperr.CollectFailed("实时查询参数失败", map[string]any{
+			"reason": firstLine(ferr.Error()),
+		})
+	}
+
+	now := time.Now()
+	pageRows, total, all := buildVariablePage(clusterID, rows, f, now)
+
+	// 写回快照（尽力而为）：写整份实时结果而不是当前页，否则翻页会把缓存覆盖成 20 条。
+	_ = s.obj.ReplaceVariables(ctx, clusterID, all)
+
+	return &VariablesResult{
+		List: pageRows, Total: total, Page: f.Page.Page, PageSize: f.Page.PageSize,
+		Live: true, Source: "show_global_variables", FetchedAt: now,
+	}, nil
+}
+
+// buildVariablePage 对实时结果做过滤 → 排序 → 分页，并返回过滤后的全量列表（写回快照用）。
+//
+// 过滤口径与快照查询保持一致：关键词匹配参数名或值，onlyDiff 只留与默认值不同的项。
+func buildVariablePage(clusterID int64, rows []collector.VariableRow, f repo.VariableFilter, now time.Time) ([]model.Variable, int64, []model.Variable) {
+	f.Page.Normalize()
+	kw := strings.ToLower(strings.TrimSpace(f.Keyword))
+	filtered := make([]model.Variable, 0, len(rows))
+	for _, r := range rows {
+		if kw != "" &&
+			!strings.Contains(strings.ToLower(r.Name), kw) &&
+			!strings.Contains(strings.ToLower(r.Value), kw) {
+			continue
+		}
+		differs := 0
+		if r.DefaultValue != "" && r.Value != r.DefaultValue {
+			differs = 1
+		}
+		if f.OnlyDiff && differs == 0 {
+			continue
+		}
+		dynamic := 0
+		if r.IsDynamic {
+			dynamic = 1
+		}
+		filtered = append(filtered, model.Variable{
+			ClusterID:    clusterID,
+			Name:         r.Name,
+			Value:        r.Value,
+			DefaultValue: r.DefaultValue,
+			Scope:        r.Scope,
+			IsDynamic:    dynamic,
+			Description:  r.Description,
+			Differs:      differs,
+			FetchedAt:    now,
+			CreatedAt:    now,
+		})
+	}
+	sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Name < filtered[j].Name })
+
+	total := int64(len(filtered))
+	start := f.Page.Offset()
+	if start > len(filtered) {
+		start = len(filtered)
+	}
+	end := start + f.Page.PageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[start:end], total, filtered
 }
 
 // ExportVariables 导出参数 CSV。

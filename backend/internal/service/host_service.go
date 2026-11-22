@@ -29,6 +29,9 @@ func NewHostService(hosts *repo.HostRepo, instances *repo.InstanceRepo, clusters
 // SetEngine 注入任务引擎。
 func (s *HostService) SetEngine(e *job.Engine) { s.engine = e }
 
+// EngineBound 报告任务引擎是否已注入。
+func (s *HostService) EngineBound() bool { return s.engine != nil }
+
 // List 分页查询主机。
 func (s *HostService) List(ctx context.Context, f repo.HostFilter) (*repo.ListResult[repo.HostRow], error) {
 	rows, total, err := s.hosts.List(ctx, f)

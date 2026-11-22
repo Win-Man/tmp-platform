@@ -33,7 +33,7 @@ import type {
   TopologyGroup,
   TopologyResult,
   UserProfile,
-  VariableRow,
+  VariablesPage,
 } from './types'
 
 /** 集群详情（含纳管信息与凭据掩码）。 */
@@ -313,8 +313,17 @@ export const tidbApi = {
     }),
   killSessions: (id: number, sessionIds: number[]) =>
     request<{ jobId: number }>({ url: `/clusters/${id}/sessions/kill`, method: 'post', data: { sessionIds } }),
+  /** 参数快照（上次采集结果）。 */
   variables: (id: number, params: Record<string, unknown>) =>
-    request<PageData<VariableRow>>({ url: `/clusters/${id}/variables`, method: 'get', params }),
+    request<VariablesPage>({ url: `/clusters/${id}/variables`, method: 'get', params }),
+  /** 实时执行 SHOW GLOBAL VARIABLES（silent=true 时不弹全局错误条，由页面兜底提示）。 */
+  refreshVariables: (id: number, params: Record<string, unknown>, silent = false) =>
+    request<VariablesPage>({
+      url: `/clusters/${id}/variables`,
+      method: 'get',
+      params: { ...params, live: 1 },
+      headers: silent ? { 'X-TMP-Silent': '1' } : undefined,
+    }),
   updateVariable: (id: number, name: string, value: string) =>
     request<null>({ url: `/clusters/${id}/variables`, method: 'put', data: { name, value } }),
   exportVariablesUrl: (id: number, onlyDiff: boolean) =>

@@ -402,7 +402,8 @@ CREATE TABLE sessions (
   command     TEXT,
   time_sec    INTEGER NOT NULL DEFAULT 0,
   state       TEXT,
-  sql_digest  TEXT,                                              -- 截断到 200 字符
+  sql_text    TEXT,                                              -- INFO（SQL 原文），截断到 200 字符
+  sql_digest  TEXT,                                              -- DIGEST（SQL 指纹）
   fetched_at  DATETIME NOT NULL,
   created_at  DATETIME NOT NULL,
   FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
@@ -807,9 +808,9 @@ erDiagram
 | GET | `/api/v1/clusters/:id/resource-groups` | v7.5+ 正常；否则 409+40901 | A/O/V（P1） |
 | POST | `/api/v1/clusters/:id/resource-groups/bind` | `{userName,host,resourceGroup}` | A/O（P1） |
 | POST | `/api/v1/clusters/:id/resource-groups/unbind` | `{userName,host}` | A/O（P1） |
-| GET | `/api/v1/clusters/:id/sessions` | 默认读采集快照；`live=1` 实时查 `information_schema.cluster_processlist`（页面「刷新会话」）；分页 + `sortBy=time\|id` + `keyword`（用户/来源/实例/库/SQL） | A/O/V（P1） |
+| GET | `/api/v1/clusters/:id/sessions` | 默认读采集快照；`live=1` 实时查 `information_schema.cluster_processlist`（页面「刷新会话」），返回 `sqlText`（INFO）与 `sqlDigest`（DIGEST）两列；分页 + `sortBy=time\|id` + `keyword`（用户/来源/实例/库/SQL 原文/指纹） | A/O/V（P1） |
 | POST | `/api/v1/clusters/:id/sessions/kill` | `{sessionIds:[]}`；异步任务，逐条结果 | A/O（P1） |
-| GET | `/api/v1/clusters/:id/variables` | 分页 + `keyword` + `onlyDiff=true` | A/O/V |
+| GET | `/api/v1/clusters/:id/variables` | 默认读采集快照；`live=1` 实时执行 `SHOW GLOBAL VARIABLES`（页面「刷新参数」），并用 `information_schema.variables_info` 补默认值/作用域；分页 + `keyword` + `onlyDiff=true` | A/O/V |
 | GET | `/api/v1/clusters/:id/variables/export` | 导出 CSV 附件 | A/O/V |
 | PUT | `/api/v1/clusters/:id/variables` | **P1 且白名单**（D-1）；非白名单 40301 | A/O（P1） |
 | GET | `/api/v1/clusters/:id/slow-queries` | `?range=&limit=` | A/O/V（P2） |

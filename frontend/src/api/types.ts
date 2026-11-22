@@ -211,6 +211,9 @@ export interface SessionRow {
   command: string
   timeSec: number
   state?: string
+  /** 正在执行的 SQL 原文（processlist.INFO），空闲会话为空。 */
+  sqlText?: string
+  /** SQL 指纹（processlist.DIGEST），同一条语句的归一化结果。 */
   sqlDigest?: string
   fetchedAt?: string
 }
@@ -232,6 +235,13 @@ export interface VariableRow {
   isDynamic: number
   description?: string
   differs: number
+  fetchedAt?: string
+}
+
+/** 参数列表：live=true 表示实时执行 SHOW GLOBAL VARIABLES 的结果。 */
+export interface VariablesPage extends PageData<VariableRow> {
+  live?: boolean
+  source?: string
   fetchedAt?: string
 }
 

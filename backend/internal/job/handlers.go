@@ -784,6 +784,11 @@ func (e *Engine) handleKillSession(ctx context.Context, r *Runner) error {
 	}); derr != nil {
 		return derr
 	}
+	// 快照表里找不到这些会话 id：通常是页面停留太久、会话已经断开，
+	// 或期间又刷新过一次导致 id 变了。直接给出可读原因，不要静默成功。
+	if len(sessions) == 0 {
+		return errors.New("未找到待 Kill 的会话（可能已断开或已结束），请刷新会话列表后重试")
+	}
 
 	target, terr := e.buildTarget(ctx, cluster)
 	if terr != nil {
@@ -820,6 +825,11 @@ func (e *Engine) handleKillSession(ctx context.Context, r *Runner) error {
 
 	r.SetResult("killed", successCount)
 	r.SetResult("total", len(sessions))
+	if successCount == 0 {
+		// 全部失败时不要让任务显示成功：用户以为 Kill 生效、实际连接还在，
+		// 只会在「刷新会话发现还在」时更迷惑。
+		return fmt.Errorf("全部 %d 个会话 Kill 失败，详见任务日志", len(sessions))
+	}
 	return nil
 }
 

@@ -245,6 +245,9 @@ func (h *Handlers) KillSessions(c *gin.Context) {
 }
 
 // ListVariables GET /api/v1/clusters/:id/variables
+//
+// live=1 时实时执行 SHOW GLOBAL VARIABLES（页面刷新按钮），
+// 否则读取上次采集的参数快照。
 func (h *Handlers) ListVariables(c *gin.Context) {
 	id, ok := Int64Param(c, "id")
 	if !ok {
@@ -254,6 +257,15 @@ func (h *Handlers) ListVariables(c *gin.Context) {
 		Keyword:  rawQuery(c, "keyword"),
 		OnlyDiff: BoolQuery(c, "onlyDiff"),
 		Page:     PageParams(c),
+	}
+	if BoolQuery(c, "live") {
+		res, err := h.TiDBObj.RefreshVariables(c.Request.Context(), id, f)
+		if err != nil {
+			Fail(c, err)
+			return
+		}
+		OK(c, res)
+		return
 	}
 	res, err := h.TiDBObj.ListVariables(c.Request.Context(), id, f)
 	if err != nil {

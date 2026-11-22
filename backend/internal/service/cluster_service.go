@@ -79,6 +79,9 @@ func NewClusterService(d ClusterDeps) *ClusterService {
 // SetEngine 注入任务引擎（解决构造期循环依赖）。
 func (s *ClusterService) SetEngine(e *job.Engine) { s.engine = e }
 
+// EngineBound 报告任务引擎是否已注入。
+func (s *ClusterService) EngineBound() bool { return s.engine != nil }
+
 // ---------------------------------------------------------------------------
 // DTO
 // ---------------------------------------------------------------------------
@@ -1231,6 +1234,7 @@ func (s *ClusterService) PersistSnapshot(ctx context.Context, clusterID int64, s
 			Command:   se.Command,
 			TimeSec:   se.TimeSec,
 			State:     se.State,
+			SQLText:   se.SQLText,
 			SQLDigest: se.SQLDigest,
 			FetchedAt: now,
 			CreatedAt: now,

@@ -147,10 +147,18 @@ func run() error {
 		Cipher: cipher, Collector: mode.Current, IsMock: mode.IsMock, Log: log,
 	}, defaultWorkers)
 	// 端口后注入，打破 service ↔ job 的构造期循环依赖。
+	// 统一走 EngineBindable 列表 + 自检：漏掉任何一个持有 engine 的服务，
+	// 都会让对应动作在运行时拿到 nil engine（Kill 会话曾因此 500）。
 	engine.SetSink(clusterSvc)
 	engine.SetInspector(inspectSvc)
-	clusterSvc.SetEngine(engine)
-	inspectSvc.SetEngine(engine)
+	for _, svc := range []service.EngineBindable{
+		clusterSvc, inspectSvc, hostSvc, tidbObjSvc, jobSvc,
+	} {
+		svc.SetEngine(engine)
+		if !svc.EngineBound() {
+			return fmt.Errorf("服务 %T 注入任务引擎失败", svc)
+		}
+	}
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()

@@ -298,13 +298,17 @@ type SessionRow struct {
 	ID int64 `json:"id"`
 	// Instance 会话所在的 TiDB 实例（ip:port），来自 cluster_processlist.INSTANCE；
 	// 退回 processlist 时用当前连接地址兜底。
-	Instance  string `json:"instance"`
-	UserName  string `json:"userName"`
-	Host      string `json:"host"`
-	DB        string `json:"db"`
-	Command   string `json:"command"`
-	TimeSec   int    `json:"timeSec"`
-	State     string `json:"state"`
+	Instance string `json:"instance"`
+	UserName string `json:"userName"`
+	Host     string `json:"host"`
+	DB       string `json:"db"`
+	Command  string `json:"command"`
+	TimeSec  int    `json:"timeSec"`
+	State    string `json:"state"`
+	// SQLText 正在执行的 SQL 原文（processlist.INFO），Sleep 等空闲会话为空。
+	SQLText string `json:"sqlText"`
+	// SQLDigest SQL 指纹（processlist.DIGEST），同一条语句的归一化结果；
+	// 老版本 TiDB 没有该列时为空。
 	SQLDigest string `json:"sqlDigest"`
 }
 

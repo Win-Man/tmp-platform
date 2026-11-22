@@ -16,8 +16,8 @@ import (
 func TestBuildSessionPage(t *testing.T) {
 	now := time.Now()
 	rows := []collector.SessionRow{
-		{ID: 1, Instance: "10.0.0.1:4000", UserName: "app_order", Host: "10.1.1.1:5000", DB: "order_db", TimeSec: 5, SQLDigest: "select 1"},
-		{ID: 2, Instance: "10.0.0.2:4000", UserName: "root", Host: "10.1.1.2:5000", TimeSec: 60, SQLDigest: "select * from orders"},
+		{ID: 1, Instance: "10.0.0.1:4000", UserName: "app_order", Host: "10.1.1.1:5000", DB: "order_db", TimeSec: 5, SQLText: "select 1", SQLDigest: "aaa111"},
+		{ID: 2, Instance: "10.0.0.2:4000", UserName: "root", Host: "10.1.1.2:5000", TimeSec: 60, SQLText: "select * from orders", SQLDigest: "bbb222"},
 		{ID: 3, Instance: "10.0.0.1:4000", UserName: "bi", Host: "10.1.1.3:5000", TimeSec: 30},
 	}
 
@@ -71,6 +71,25 @@ func TestBuildSessionPage(t *testing.T) {
 		}
 		if len(got) != 1 || got[0].SessionID != 1 {
 			t.Fatalf("第 2 页内容错误: %+v", got)
+		}
+	})
+
+	t.Run("SQL 原文与 DIGEST 分别落库", func(t *testing.T) {
+		// 两者语义不同：SQLText 是 INFO 原文，SQLDigest 是归一化指纹，
+		// 前端两列各展示一份，不能互相覆盖。
+		got, _, _ := buildSessionPage(7, rows, repo.SessionFilter{SortBy: "id", Page: repo.Page{Page: 1, PageSize: 20}}, now)
+		if got[0].SQLText != "select 1" || got[0].SQLDigest != "aaa111" {
+			t.Fatalf("会话 1 的 SQL 字段错误: text=%q digest=%q", got[0].SQLText, got[0].SQLDigest)
+		}
+		if got[1].SQLText != "select * from orders" || got[1].SQLDigest != "bbb222" {
+			t.Fatalf("会话 2 的 SQL 字段错误: text=%q digest=%q", got[1].SQLText, got[1].SQLDigest)
+		}
+	})
+
+	t.Run("关键词命中 DIGEST", func(t *testing.T) {
+		got, total, _ := buildSessionPage(7, rows, repo.SessionFilter{Keyword: "BBB", Page: repo.Page{Page: 1, PageSize: 20}}, now)
+		if total != 1 || got[0].SessionID != 2 {
+			t.Fatalf("按 DIGEST 关键词应只命中会话 2，实际 total=%d", total)
 		}
 	})
 

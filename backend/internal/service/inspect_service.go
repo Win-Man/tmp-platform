@@ -66,6 +66,9 @@ func NewInspectService(d InspectDeps) *InspectService {
 // SetEngine 注入任务引擎。
 func (s *InspectService) SetEngine(e *job.Engine) { s.jobEng = e }
 
+// EngineBound 报告任务引擎是否已注入。
+func (s *InspectService) EngineBound() bool { return s.jobEng != nil }
+
 // ---------------------------------------------------------------------------
 // 模板与巡检项
 // ---------------------------------------------------------------------------
