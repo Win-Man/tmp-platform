@@ -26,13 +26,13 @@ func TestRGClause(t *testing.T) {
 		{"rg6", "600", "", false, true, "`rg6` RU_PER_SEC = 600 BURSTABLE = FALSE", false},
 		{"rg7", "100", "MEDIUM", false, true, "`rg7` RU_PER_SEC = 100 PRIORITY = MEDIUM BURSTABLE = FALSE", false},
 		// 校验失败场景。
-		{"bad-name", "100", "", false, false, "", true},   // 连字符不合法
-		{"rg", "abc", "", false, false, "", true},         // RU 非数字
-		{"rg", "-1", "", false, false, "", true},          // 负数不合法
-		{"rg", "100", "INVALID", false, false, "", true},  // 非法优先级
+		{"bad-name", "100", "", false, false, "", true},                           // 连字符不合法
+		{"rg", "abc", "", false, false, "", true},                                 // RU 非数字
+		{"rg", "-1", "", false, false, "", true},                                  // 负数不合法
+		{"rg", "100", "INVALID", false, false, "", true},                          // 非法优先级
 		{"default", "100", "", false, false, "`default` RU_PER_SEC = 100", false}, // default 允许 ALTER（底层不拦截，创建层拦截）
-		{"select", "100", "", false, false, "", true},     // 关键字黑名单
-		{"", "100", "", false, false, "", true},           // 空名称
+		{"select", "100", "", false, false, "", true},                             // 关键字黑名单
+		{"", "100", "", false, false, "", true},                                   // 空名称
 	}
 	for _, c := range cases {
 		t.Run(c.name+"/"+c.ruPerSec+"/"+c.priority, func(t *testing.T) {
