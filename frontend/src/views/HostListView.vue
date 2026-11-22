@@ -33,8 +33,21 @@
           <el-select v-model="filters.arch" placeholder="CPU 架构" clearable style="width: 140px" @change="search">
             <el-option v-for="arch in arches" :key="arch" :label="arch" :value="arch" />
           </el-select>
-          <el-select v-model="filters.clusterId" placeholder="所属集群" clearable style="width: 180px" @change="search">
-            <el-option v-for="c in clusters" :key="c.id" :label="c.name" :value="c.id" />
+          <el-select
+            v-model="filters.clusterId"
+            placeholder="所属集群"
+            clearable
+            filterable
+            style="width: 220px"
+            @change="search"
+          >
+            <!-- 不同中控机上允许同名集群，下拉项带中控机才能区分 -->
+            <el-option
+              v-for="c in clusters"
+              :key="c.id"
+              :label="clusterOptionLabel(c)"
+              :value="c.id"
+            />
           </el-select>
           <el-button @click="search">查询</el-button>
         </div>
@@ -67,8 +80,27 @@
               <div class="text-muted" style="font-size: 12px">{{ row.hostname || '—' }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="所属集群" min-width="160">
-            <template #default="{ row }">{{ (row.clusterNames || []).join(', ') || '—' }}</template>
+          <el-table-column label="所属集群" min-width="200">
+            <template #default="{ row }">
+              <template v-if="hostClusters(row).length > 0">
+                <el-tooltip
+                  v-for="c in hostClusters(row)"
+                  :key="c.id"
+                  :content="`中控机 ${c.tiupHost || '—'}`"
+                  placement="top"
+                >
+                  <router-link
+                    :to="`/clusters/${c.id}`"
+                    class="cluster-tag no-underline"
+                  >
+                    <el-tag size="small" effect="plain" :type="duplicateName(row, c.name) ? 'warning' : 'primary'">
+                      {{ clusterTagText(row, c) }}
+                    </el-tag>
+                  </router-link>
+                </el-tooltip>
+              </template>
+              <span v-else class="text-muted">—</span>
+            </template>
           </el-table-column>
           <el-table-column label="角色" min-width="200">
             <template #default="{ row }">
@@ -77,9 +109,17 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="cpuArch" label="架构" width="90" />
+          <el-table-column label="架构" width="110">
+            <template #default="{ row }">
+              <span v-if="row.cpuArch" class="mono">{{ row.cpuArch }}</span>
+              <span v-else class="text-muted">—</span>
+            </template>
+          </el-table-column>
           <el-table-column label="规格" width="140">
-            <template #default="{ row }">{{ row.cpuCores }}C / {{ row.memoryGb }}G</template>
+            <template #default="{ row }">
+              <span v-if="hasSpec(row)">{{ row.cpuCores }}C / {{ fmtNum(row.memoryGb, 1) }}G</span>
+              <span v-else class="text-muted">—</span>
+            </template>
           </el-table-column>
           <el-table-column label="CPU" width="120">
             <template #default="{ row }">
@@ -139,7 +179,10 @@
                 </template>
               </el-table-column>
               <el-table-column label="规格" width="130">
-                <template #default="{ row }">{{ row.cpuCores }}C / {{ row.memoryGb }}G</template>
+                <template #default="{ row }">
+                  <span v-if="hasSpec(row)">{{ row.cpuCores }}C / {{ fmtNum(row.memoryGb, 1) }}G</span>
+                  <span v-else class="text-muted">—</span>
+                </template>
               </el-table-column>
               <el-table-column label="CPU / 内存 / 磁盘" width="220">
                 <template #default="{ row }">
@@ -167,7 +210,7 @@ import { Refresh, Search } from '@element-plus/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { clusterApi, hostApi } from '@/api'
-import type { ClusterOption, HostRow } from '@/api/types'
+import type { ClusterOption, HostClusterBrief, HostRow } from '@/api/types'
 import { fmtNum, formatTime, usageColor } from '@/utils/format'
 import { queryInt, queryString, syncQuery } from '@/utils/query'
 import { useAuthStore } from '@/stores/auth'
@@ -249,6 +292,41 @@ function onSelectionChange(val: HostRow[]): void {
   selectedIds.value = val.map((h) => h.id)
 }
 
+/** 主机所属集群明细；后端未返回时退回 clusterNames 构造（兼容旧接口）。 */
+function hostClusters(row: HostRow): HostClusterBrief[] {
+  if (row.clusters && row.clusters.length > 0) {
+    return row.clusters
+  }
+  if (!row.clusterNames || row.clusterNames.length === 0) {
+    return []
+  }
+  const ids = row.clusterIds || []
+  return row.clusterNames.map((name, i) => ({ id: ids[i] || 0, name, tiupHost: '' }))
+}
+
+/** 同一台主机上是否出现了同名集群（多套集群可能重名，需靠中控机区分）。 */
+function duplicateName(row: HostRow, name: string): boolean {
+  return hostClusters(row).filter((c) => c.name === name).length > 1
+}
+
+/** 集群标签文本：同名集群追加 @中控机，否则只显示集群名（中控机在 hover 提示里）。 */
+function clusterTagText(row: HostRow, c: HostClusterBrief): string {
+  if (duplicateName(row, c.name) && c.tiupHost) {
+    return `${c.name}@${c.tiupHost}`
+  }
+  return c.name
+}
+
+/** 所属集群筛选下拉项文案：集群名 @ 中控机（中控机为空时不追加）。 */
+function clusterOptionLabel(c: ClusterOption): string {
+  return c.tiupHost ? `${c.name} @ ${c.tiupHost}` : c.name
+}
+
+/** 是否有硬件规格（0 值说明还没采到，展示 — 而不是 0C / 0G）。 */
+function hasSpec(row: HostRow): boolean {
+  return (row.cpuCores || 0) > 0 || (row.memoryGb || 0) > 0
+}
+
 async function runSSHCheck(): Promise<void> {
   const res = await hostApi.sshCheck(selectedIds.value)
   ElMessage.success(`SSH 检测任务 #${res.jobId} 已提交`)
@@ -283,5 +361,11 @@ onMounted(async () => {
 
 .group-name {
   font-weight: 600;
+}
+
+/* 所属集群标签：多集群共享主机时一行展示多个 */
+.cluster-tag {
+  display: inline-block;
+  margin: 0 4px 2px 0;
 }
 </style>

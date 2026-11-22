@@ -250,7 +250,7 @@ CREATE UNIQUE INDEX uk_users_username ON platform_users(username);
 CREATE TABLE clusters (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   name              TEXT    NOT NULL,                          -- 展示名，保留大小写
-  name_lower        TEXT    NOT NULL,                          -- 小写唯一键；移除纳管时改写为 name||'#removed#'||id
+  name_lower        TEXT    NOT NULL,                          -- 小写名；与 tiup_host 组成业务唯一键；移除纳管时改写为 name||'#removed#'||id
   draft             INTEGER NOT NULL DEFAULT 0,                -- 1=仅保存草稿，不计入统计
   tidb_version      TEXT,
   deploy_mode       TEXT    NOT NULL DEFAULT 'unknown',        -- majority|dr_auto_sync|unknown
@@ -277,6 +277,8 @@ CREATE TABLE clusters (
   last_collect_at   DATETIME,
   last_success_at   DATETIME,
   last_collect_error TEXT,
+  collect_source    TEXT,                                      -- display_json|display_text|meta_yaml（最近一次采集来源）
+  collect_warnings  TEXT,                                      -- JSON array：TiUP 报告状态与实测连通性的矛盾
   capabilities      TEXT,                                      -- JSON: Capabilities 快照
   fetched_at        DATETIME,                                  -- 数据截至（降级展示用）
   created_by        INTEGER,
@@ -285,7 +287,8 @@ CREATE TABLE clusters (
   deleted_at        DATETIME,                                  -- 移除纳管=软删，报告保留
   FOREIGN KEY (created_by) REFERENCES platform_users(id)
 );
-CREATE UNIQUE INDEX uk_clusters_name_lower ON clusters(name_lower);
+-- 集群唯一键是「同一中控机内唯一」：同一批机器上可部署多套集群，不同中控机允许同名
+CREATE UNIQUE INDEX uk_clusters_host_name ON clusters(tiup_host, name_lower);
 CREATE INDEX idx_clusters_status ON clusters(status);
 CREATE INDEX idx_clusters_deleted ON clusters(deleted_at);
 
@@ -305,7 +308,7 @@ CREATE TABLE cluster_credentials (
 );
 CREATE UNIQUE INDEX uk_cred_cluster ON cluster_credentials(cluster_id);
 
--- 4) 主机（全局，跨集群共享同一 IP）
+-- 4) 主机（全局，跨集群共享同一 IP；按 IP 全局唯一，一台机器可同时属于多套集群，instances.host_id 天然多对多）
 CREATE TABLE hosts (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   ip                   TEXT    NOT NULL,
@@ -387,11 +390,12 @@ CREATE TABLE resource_groups (
 );
 CREATE UNIQUE INDEX uk_rg ON resource_groups(cluster_id, name);
 
--- 8) 会话快照（processlist）
+-- 8) 会话快照（cluster_processlist）
 CREATE TABLE sessions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   cluster_id  INTEGER NOT NULL,
   session_id  INTEGER NOT NULL,
+  instance    TEXT,                                              -- 会话所在 TiDB 实例（ip:port）
   user_name   TEXT,
   host        TEXT,
   db          TEXT,
@@ -403,7 +407,8 @@ CREATE TABLE sessions (
   created_at  DATETIME NOT NULL,
   FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
 );
-CREATE UNIQUE INDEX uk_sessions ON sessions(cluster_id, session_id);
+-- cluster_processlist 下 session_id 只在实例内唯一，唯一键必须带 instance
+CREATE UNIQUE INDEX uk_sessions ON sessions(cluster_id, instance, session_id);
 
 -- 9) 全局变量快照（SHOW GLOBAL VARIABLES）
 CREATE TABLE variables (
@@ -649,7 +654,7 @@ erDiagram
   }
   clusters {
     int64 id PK
-    string name_lower UK
+    string name_lower "与 tiup_host 组成唯一键 (tiup_host, name_lower)"
     string status "healthy|degraded|error|unknown"
     string deploy_mode
     datetime fetched_at
@@ -723,11 +728,11 @@ erDiagram
 | code | HTTP | 含义 | 典型场景 |
 | --- | --- | --- | --- |
 | 0 | 200 | 成功 | — |
-| 40001 | 400 | 参数错误 | 端口越界、密码策略不满足、集群名重复（格式类） |
+| 40001 | 400 | 参数错误 | 端口越界、密码策略不满足、同一中控机上集群名重复（`该中控机上已存在同名集群`） |
 | 40101 | 401 | 未认证/凭证错误/token 过期或被吊销 | 登录失败、token_version 不匹配 |
 | 40301 | 403 | 无权限 | 越权操作、非白名单参数修改 |
 | 40401 | 404 | 资源不存在 | 集群 ID / 任务 ID / 报告号不存在 |
-| 40901 | 409 | 版本不支持 / 状态冲突 | RG 查询在 v6.5（D-6）、集群名已存在、任务已结束不可取消 |
+| 40901 | 409 | 版本不支持 / 状态冲突 | RG 查询在 v6.5（D-6）、任务已结束不可取消 |
 | 42901 | 429 | 触发限流或锁定 | 连续 5 次登录失败，账号锁 10 分钟（data 带 `lockedUntil`） |
 | 50001 | 500 | 内部错误 | 未捕获异常（不暴露堆栈） |
 | 50201 | 502 | 采集失败 | SSH/DB/PD 通道失败，data 带 `channel`、`reason` |
@@ -772,14 +777,14 @@ erDiagram
 | GET | `/api/v1/clusters/options` | 下拉用精简列表 `[{id,name,status}]` | A/O/V |
 | POST | `/api/v1/clusters/test-connection` | body=接管表单；返回 `[{scope,ok,latencyMs,message}]`，整体 15s；`pdEndpoint` 留空时并行自动发现并返回 `discovered` | A/O |
 | POST | `/api/v1/clusters/discover-pd` | body=接管表单（name/tiupHost/dbHost 等）；返回 `{endpoints[],primary,source,message}`，source ∈ tiup_meta/cluster_info/mock | A/O |
-| POST | `/api/v1/clusters` | 接管：`{name,tiupHost,tiupPort,tiupUser,sshPassword,dbHost,dbPort,dbUser,dbPassword,pdEndpoint,saveAsDraft}`；返回 `{clusterId,jobId}` | A/O |
+| POST | `/api/v1/clusters` | 接管：`{name,tiupHost,tiupPort,tiupUser,sshPassword,dbHost,dbPort,dbUser,dbPassword,pdEndpoint,saveAsDraft}`；返回 `{clusterId,jobId}`。唯一键 `(tiup_host,name_lower)`：同一中控机上重名返回 40001「该中控机上已存在同名集群」，不同中控机允许同名 | A/O |
 | GET | `/api/v1/clusters/:id` | 详情（凭据仅掩码） | A/O/V |
 | PUT | `/api/v1/clusters/:id` | 编辑纳管信息（P1），改后置 `collect_status=degraded` 提示重采 | A/O |
 | DELETE | `/api/v1/clusters/:id` | 移除纳管（软删），body `{confirmName}`；不影响真实集群 | A/O（P1） |
 | POST | `/api/v1/clusters/:id/refresh` | 建 collect 任务；已有进行中则复用返回同 `jobId` | A/O |
 | POST | `/api/v1/clusters/batch-refresh` | body `{ids:[]}`；返回 `[{clusterId,jobId}]` | A/O |
 | GET | `/api/v1/clusters/:id/overview` | 基础信息 + 组件版本汇总 + 实例摘要 + 最近任务 + `fetchedAt` | A/O/V |
-| GET | `/api/v1/clusters/:id/topology` | `{groups:[{component,nodes:[{id,hostIp,port,status,role,version}]}]}` | A/O/V |
+| GET | `/api/v1/clusters/:id/topology` | 双视角：`hosts:[{hostIp,hostname,sshStatus,cpuCores,memoryGb,instanceCount,components,instances:[{id,component,hostIp,port,statusPort,status,role,version}]}]`（主视角，按主机聚合、IP 数值序、实例按组件业务序）+ `groups:[{component,nodes}]` + `nodeCount/hostCount` | A/O/V |
 | GET | `/api/v1/clusters/:id/instances` | 分页 + `component/status` 筛选 | A/O/V |
 | GET | `/api/v1/clusters/:id/components` | 按组件聚合实例数与版本，含 `versionConsistent` | A/O/V |
 | GET | `/api/v1/clusters/:id/capabilities` | `Capabilities` + `featureVisible` 映射 | A/O/V |
@@ -802,7 +807,7 @@ erDiagram
 | GET | `/api/v1/clusters/:id/resource-groups` | v7.5+ 正常；否则 409+40901 | A/O/V（P1） |
 | POST | `/api/v1/clusters/:id/resource-groups/bind` | `{userName,host,resourceGroup}` | A/O（P1） |
 | POST | `/api/v1/clusters/:id/resource-groups/unbind` | `{userName,host}` | A/O（P1） |
-| GET | `/api/v1/clusters/:id/sessions` | 分页 + `sortBy=time\|id` + `keyword`；>60s Query 标记 | A/O/V（P1） |
+| GET | `/api/v1/clusters/:id/sessions` | 默认读采集快照；`live=1` 实时查 `information_schema.cluster_processlist`（页面「刷新会话」）；分页 + `sortBy=time\|id` + `keyword`（用户/来源/实例/库/SQL） | A/O/V（P1） |
 | POST | `/api/v1/clusters/:id/sessions/kill` | `{sessionIds:[]}`；异步任务，逐条结果 | A/O（P1） |
 | GET | `/api/v1/clusters/:id/variables` | 分页 + `keyword` + `onlyDiff=true` | A/O/V |
 | GET | `/api/v1/clusters/:id/variables/export` | 导出 CSV 附件 | A/O/V |
@@ -813,7 +818,7 @@ erDiagram
 
 | 方法 | 路径 | 说明 | 角色 |
 | --- | --- | --- | --- |
-| GET | `/api/v1/hosts` | 分页 + `clusterId/arch/sshStatus/keyword`；返回角色分布、所属集群列表 | A/O/V |
+| GET | `/api/v1/hosts` | 分页 + `clusterId/arch/sshStatus/keyword`；返回角色分布、所属集群 `clusters:[{id,name,tiupHost}]`（一台主机可属多套集群，`tiupHost` 用于区分同名集群） | A/O/V |
 | GET | `/api/v1/hosts/grouped` | 按集群分组视图 `[{clusterId,clusterName,hosts:[]}]` | A/O/V |
 | GET | `/api/v1/hosts/:id` | 详情（P2 页面，接口 MVP 先给） | A/O/V |
 | GET | `/api/v1/hosts/:id/metrics` | 资源趋势 | A/O/V（P1） |
@@ -933,7 +938,8 @@ type PDChannel interface {
 }
 
 // PDDiscoverer 可选能力：自动发现 PD 地址（接管表单无需用户手填）。
-// 真实模式：SSH 读 meta.yaml 的 pd_servers → MySQL 查 information_schema.cluster_info；
+// 真实模式：SSH/本地读 meta.yaml 的 topology.pd_servers（client_port）→ tiup cluster display
+//          → MySQL 查 information_schema.cluster_info；
 // 演示模式：从内置数据集取 PD 实例。
 type PDDiscovery struct{ Endpoints []string; Source, Message string }
 type PDDiscoverer interface {
@@ -1017,37 +1023,90 @@ sequenceDiagram
   API-->>FE: progress / currentStep
 ```
 
-### 6.3 TiUP meta.yaml → 数据表字段映射
+### 6.3 TiUP 拓扑采集顺序与 meta.yaml → 数据表字段映射
+
+**采集顺序**（`ssh.go: FetchTiUPMeta`，三级，前一级成功即返回，全失败时把各级原因聚合上报）：
+
+1. `tiup cluster display <name> --format=json`（**首选**，`Source=display_json`）：结构稳定，且直接给出 `cluster_version` / `dashboard_urls` / `grafana_urls`，无需自行从拓扑拼装；输出尾部可能跟一段 `{"exit_code":0}`（部分版本或 stderr 被合并时），因此解析用 `json.Decoder` 只取**第一个** JSON 值；
+2. `cat <tiup_dir>/storage/cluster/clusters/<name>/meta.yaml`（二级兜底，`Source=meta_yaml`）：display 不可用时读原始拓扑；
+3. `tiup cluster display <name>` 文本输出（三级兜底，`Source=display_text`）：解析头部键值行 + 空格对齐的实例表格。注意 `-T` 在 TiUP 1.17 上**不存在**（报 `unknown shorthand flag: 'T'`），非 TTY 环境下该命令本身就输出纯文本表格。
+
+真实 TiUP（v1.9+）生成的 meta.yaml 与早期文档假设的结构有两处关键差异，实现时必须兼容：
+
+1. server 列表嵌套在 **`topology:`** 段下，不是顶层键；
+2. 版本键是 **`tidb_version`**（顶层），PD 只有 `client_port` / `peer_port`，**没有** `port`；架构写在每个 server 上，`global.arch` 通常为空。
+
+`TiUPMeta.UnmarshalYAML` 同时解嵌套与扁平两种写法（先按扁平解，`topology` 段内列表非空时覆盖），因此新旧 meta.yaml 都能读。
 
 | meta.yaml 路径 | 目标 | 说明 |
 | --- | --- | --- |
-| `cluster_version` | `clusters.tidb_version` | 兜底取 MySQL `SELECT VERSION()` |
-| `global.arch`（常为空） | `clusters.cpu_arch` | 为空时用 SSH `uname -m` 归一为 `x86_64`/`aarch64` |
-| `pd_servers[].host/.port` | `instances(component=pd, port=2379)` | 首个标记 `role=leader`（可被 PD members 校准） |
-| `tidb_servers[].host/.port/.status_port/.deploy_dir` | `instances(component=tidb, port=4000)` | `status_port=10080` |
-| `tikv_servers[].host/.port/.status_port/.data_dir/.deploy_dir` | `instances(component=tikv, port=20160)` | `status_port=20180` |
-| `tiflash_servers[]` | `instances(component=tiflash)` | 无该段则跳过 |
-| `cdc_servers[]` 或 `ticdc_servers[]` | `instances(component=ticdc, port=8300)` | 兼容两种键名 |
-| `grafana_servers[].host` + `global.grafana_port`(默认 3000) | `clusters.grafana_urls` + `instances(component=grafana)` | 多实例 → JSON 数组 |
-| `monitoring_servers[].host` + 9090 | `clusters.prometheus_urls` | 可多个 |
-| `alertmanager_servers[].host` + 9093 | `clusters.alertmanager_urls` | 可多个 |
-| PD 主机 + 2379 | `clusters.dashboard_urls` = `http://<pd>:2379/dashboard` | TiDB Dashboard 由 PD 提供 |
+| `tidb_version` → `cluster_version` → `version` | `clusters.tidb_version` | 按优先级取首个非空；兜底取 MySQL `SELECT VERSION()`；统一补 `v` 前缀（`NormalizeVersion`） |
+| `global.arch` → 各 `*_servers[].arch` | `clusters.cpu_arch` | 真实 meta 常把 arch 写在 server 级；都为空时用 `uname -m` 归一为 `x86_64`/`aarch64` |
+| `topology.pd_servers[]`（`host`/`name`/`ip`、`client_port`、`peer_port`） | `instances(component=pd, port=client_port)` | 无 `port` 时取 `client_port`（默认 2379），`status_port` 取 `peer_port`；首个标记 `role=leader`（可被 PD members 校准） |
+| `topology.tidb_servers[].host/port/status_port/deploy_dir` | `instances(component=tidb, port=4000)` | `status_port=10080` |
+| `topology.tiproxy_servers[]` | `instances(component=tiproxy, port=4000)` | `status_port=3080`；TiDB v7+ 引入，可替代 tidb server 对外 |
+| `topology.tikv_servers[].host/port/status_port/data_dir/deploy_dir` | `instances(component=tikv, port=20160)` | `status_port=20180`；`az` 由 PD stores labels 补齐 |
+| `topology.tiflash_servers[]` | `instances(component=tiflash, port=9000)` | `status_port=8234`；无该段则跳过 |
+| `topology.cdc_servers[]` 或 `topology.ticdc_servers[]` | `instances(component=ticdc, port=8300)` | 兼容两种键名，按 `(component,host,port)` 去重 |
+| display 实例 `Status`（`Up` / `Down` / `Up|L|UI`） | `instances.status` / `instances.role` | 归一为 `up`/`down`/`unhealthy`；`Up|L|UI` 的 `L` 使该 PD 标记 `role=leader`（置于 PD 列表首位）；meta.yaml 无状态字段，缺省 `up` |
+| display `grafana_urls` / `topology.grafana_servers[].port` → `global.grafana_port`(3000) | `clusters.grafana_urls` + `instances(component=grafana)` | **display 的 `grafana_urls` 优先**（去重后直接用）；缺失时才按 server **实际端口**拼 `http://host:port` |
+| display 不提供 Prometheus URL；`topology.monitoring_servers[].port`(9090) | `clusters.prometheus_urls` | 始终按 server 实际端口推导（默认 9090），可多个 |
+| `topology.alertmanager_servers[].port`(9093) | `clusters.alertmanager_urls` | 同上，可多个 |
+| display `dashboard_urls`；缺失时 PD host + `client_port` | `clusters.dashboard_urls` | TiDB Dashboard 由 PD 提供；**display 给出显式地址时直接采用**，否则按 `http://<pd>:<client_port>/dashboard` 推导 |
 | `/pd/api/v1/replication_mode/status` | `clusters.deploy_mode` | `majority` / `dr-auto-sync` → 归一 `majority`/`dr_auto_sync` |
-| `information_schema.cluster_hardware` | `hosts.cpu_cores/memory_gb` | SSH `nproc/free` 为兜底，DB 优先（无需 SSH） |
+| `information_schema.cluster_hardware` + `cluster_load` | `hosts.cpu_arch/cpu_cores/memory_gb/disk_total_gb/*_usage_pct` | MySQL 一次查询覆盖**集群内所有主机**；SSH 只采中控机且优先，MySQL 负责给其余主机补齐（字段级只补空，不覆盖 SSH 实测值，见 §6.6.5） |
 
-**降级兜底**：meta.yaml 读取失败时执行 `tiup cluster display <name> -T` 解析文本表（固定列宽，用正则按空白切分），仍失败则该通道记 error。SSH 执行一律走 `pkg/sshcmd` 的命令白名单（`cat`、`uname`、`nproc`、`free`、`df`、`tiup cluster display`），**路径与集群名必须用 `shellescape` 校验白名单字符 `[A-Za-z0-9._/-]`，禁止任何用户输入拼接**。
+派生字段均在 `NormalizeMeta` 内一次算出：`instance_count` = 实例条数、`host_count` = 去重主机数、`component_count` = 去重组件种类数（含 tiproxy）。实例 `version` 统一用集群版本填充，避免出现 PD 返回的 `8.5.5` 与 meta 的 `v8.5.5` 两种写法并存。
+
+**meta.yaml 路径解析**（`ssh.go: metaPath()`）：
+
+| 采集器所在机器 | 路径 |
+| --- | --- |
+| 远程（SSH） | 优先 `~/.tiup/storage/cluster/clusters/<name>/meta.yaml`，回退 `/root/.tiup/...` 及 `$TIUP_HOME` |
+| 本机（TiUP 与平台同机） | `os.UserHomeDir() + /.tiup/storage/cluster/clusters/<name>/meta.yaml`，**本地直读，无需 sshd** |
+
+**降级兜底**：优先 `tiup cluster display <name> --format=json`；失败读 meta.yaml；再失败执行 `tiup cluster display <name>` 解析文本表（头部 `Cluster version` / `Dashboard URL(s)` / `Grafana URL(s)`，表格列 ID / Role / Host / Ports / OS-Arch / Status / Data Dir / Deploy Dir，含 `tiproxy`、`monitoring`→prometheus、`cdc`→ticdc、`alert_manager`→alertmanager 别名归一）；三级全失败则该通道记 error 并在 message 里带上各级原因。SSH 执行一律走 `pkg/sshcmd` 的命令白名单（`cat`、`uname`、`nproc`、`free`、`df`、`tiup cluster display`、`tiup cluster display --format=json`），**路径与集群名必须校验白名单字符 `[A-Za-z0-9._/-]`，禁止任何用户输入拼接**。
+
+**本机直读（`IsLocalHost`）**：当目标主机 IP 属于本机（`127.0.0.1`/`::1`/`localhost`/本机网卡地址）时，`sshcmd` 改用 `LocalRunner` 以 `/bin/sh -c` 本地执行同一条命令，仍走同一份命令白名单，行为与 SSH 路径完全一致，避免"TiUP 就在本机却因未装 sshd 采不到数"。
+
+#### 6.3.1 数据来源可观测与状态交叉校验
+
+**问题背景**：`tiup cluster display` 的 Status 列是 TiUP 自己发起的一次性探测结果，会因瞬时超时把整排实例误报为 `Down`（实测出现过：集群进程全程未重启、TiDB 日志持续正常，但 display 显示 5 个实例全 Down 且 Dashboard URL 整行缺失）；反过来，meta.yaml 兜底路径**没有状态字段**，代码统一按 `up` 填写。两种情形都会让界面显示与真相不符，而原来的采集日志只写"解析到 N 个实例"，用户无法判断数据从哪来、是否可信。
+
+**来源可观测**：每次采集把来源写入 `TiUPMeta.Source` → `Snapshot.Source` → `clusters.collect_source`，并在任务日志第 2 步输出中文名：
+
+| 来源值 | 含义 | 任务日志 | 可信度 |
+| --- | --- | --- | --- |
+| `display_json` | `tiup cluster display --format=json` | `元数据来源 tiup cluster display --format=json` | 最高，含实例运行状态 |
+| `display_text` | `tiup cluster display` 文本输出 | `元数据来源 tiup cluster display 文本输出` | 同上，靠文本解析 |
+| `meta_yaml` | `~/.tiup/.../meta.yaml` | `元数据来源 meta.yaml（降级）` + **warn**「meta.yaml 不含实例运行状态，本次实例状态为默认值 up，不能作为故障判断依据」 | 拓扑可信、状态不可信 |
+
+详情页「采集快照」展示 `数据来源`，`meta_yaml` 时额外打橙色「降级」标签。
+
+**状态交叉校验（`crossCheckStatus`，`collector/composite.go`）**：用平台自有通道的实测连通性校验 TiUP 报告的状态，**只告警、不改写状态**（改写会掩盖真实故障）。四条规则：
+
+| # | 条件 | 告警含义 |
+| --- | --- | --- |
+| 1 | PD 通道成功，但报告 `pd` 状态非 up | PD 的 2379 实测可访问，TiUP 的 Down 很可能是一次失败探测 |
+| 2 | MySQL 通道成功，但**全部** tidb 状态非 up | 4000 能连上，与"全部 TiDB 挂了"矛盾 |
+| 3 | PD 通道成功且有 up store，但全部 tikv 状态非 up | PD 认为 store 活着，与"全部 TiKV 挂了"矛盾 |
+| 4 | MySQL 通道失败，但拓扑显示 tidb 全部正常 | 反向场景：meta.yaml 兜底时最常见的"假正常" |
+
+告警写入 `clusters.collect_warnings`（JSON 数组，**每次采集重写，空则清空**，避免旧提示长期挂在界面上），任务日志逐条 `warn`，详情页顶部以橙色 alert 列出。部分实例 down（多 TiDB 集群）不触发告警，因为无法定位是哪一个。
 
 ### 6.4 健康判定规则（三级状态 + 降级）
 
 | 判定结果 | 条件（按序求值） | `clusters.status` / `collect_status` |
 | --- | --- | --- |
-| 成功 | `ChanErrors` 为空 | `healthy` / `healthy`；`collect_fail_streak=0` |
-| 降级 | 有 `ChanErrors` 但 ≥1 通道成功（Meta 或 MySQL 成功即视为有可用数据） | `degraded` / `degraded`；展示上次快照 + `fetched_at` |
-| 失败（本次） | `ChanErrors` 覆盖全部关键通道 | `collect_status=error`，`collect_fail_streak+1` |
+| 失败（本次） | `ChanErrors` 覆盖全部关键通道（SSH-Meta 与 MySQL 均失败） | `collect_status=error`，`collect_fail_streak+1`；**优先级最高**，down 实例不得把它洗成降级 |
+| 成功 | `ChanErrors` 为空且无 `status=down` 实例 | `healthy` / `healthy`；`collect_fail_streak=0` |
+| 降级（实例异常） | `ChanErrors` 为空**或仅 PD 失败**，但存在 `status=down` 实例（display 给出的状态） | `degraded` / `healthy`；`collect_fail_streak=0` |
+| 成功（仅 PD 失败） | 仅 PD 通道失败且无 down 实例 | `healthy` / `healthy`；`collect_fail_streak=0`（PRD R-05） |
+| 降级 | 其余有 `ChanErrors` 的情况（≥1 关键通道成功，即可用数据仍在） | `degraded` / `degraded`；展示上次快照 + `fetched_at` |
 | 异常（终态） | `collect_fail_streak >= settings.cluster.error_streak`（默认 3） 或 从未成功（`last_success_at IS NULL`） | `error`（列表红色），仍保留最后快照并置顶告警条 |
 | 未知 | 从未采集且无失败记录（刚接管 / 草稿） | `unknown` |
 
-补充：`PD` 失败不单独导致 `degraded`（PRD R-05 将其列为建议项），仅在 `overview` 对应字段显示「—」并给出 `probeErrors.pd`。**降级/异常计入总览「异常集群数」，草稿不计入任何统计。**
+补充：`PD` 失败本身不单独导致 `degraded`（PRD R-05 将其列为建议项），仅在 `overview` 对应字段显示「—」并给出 `probeErrors.pd`；**但存在 down 实例时以降级为准**——PD 的 2379 端口未对平台开放是很常见的部署形态，此时若 display 已拿到 Down 节点，集群不能继续显示健康。**降级/异常计入总览「异常集群数」，草稿不计入任何统计。**
 
 ### 6.5 超时与重试
 
@@ -1059,6 +1118,166 @@ sequenceDiagram
 | 采集失败重试 | 1 次，指数退避 2s | `settings.collect.retry`；仅在「网络类错误」重试，认证类错误不重试 |
 | 并发采集 | 默认 4（worker pool 大小），超出排队不失败 | `settings.collect.concurrency` |
 | 连接池 | MySQL `SetMaxOpenConns(2)`/`SetConnMaxLifetime(5m)`，每集群用一次性连接串，采集完关闭 | 避免连接泄漏 |
+
+### 6.6 采集实现视角：一次 Collect 的完整链路
+
+前面 6.1~6.5 描述的是契约与规则，本节描述**代码实际怎么跑**，供排错与二次开发对照。
+
+一句话总览：**采集是任务驱动的全量拉取，不是常驻轮询**。HTTP 请求只做登记并返回 `jobId`，真正的 15 秒采集跑在后台 worker 内，前端轮询任务详情查看逐步日志。
+
+#### 6.6.1 调用链
+
+```
+POST /api/v1/clusters/:id/refresh
+  └─ ClusterService.Refresh           service/cluster_service.go:935   去重 → 占位 → 入队
+     └─ job.Engine.Submit             job/engine.go:126                jobs 表落 pending
+        └─ worker（默认 4 个）         job/engine.go:203                取任务、跑步骤
+           └─ Engine.handleCollect    job/handlers.go:199              5 步编排
+              ├─ Engine.buildTarget   job/handlers.go:840              解密凭据 → Target
+              ├─ CompositeCollector.Collect  collector/composite.go:114 9 个 goroutine
+              ├─ NormalizeMeta        collector/mapping.go:138         归一化
+              └─ ClusterService.PersistSnapshot  service/cluster_service.go:1008  单事务落库
+```
+
+去重规则：若该集群已有 `pending/running` 的 `collect` 或 `takeover` 任务，`Refresh` 直接返回既有 `jobId` 并置 `reused=true`，避免连续点击产生多个并发采集。
+
+#### 6.6.2 Target 构造（凭据只在内存存活）
+
+| 来源 | 字段 |
+| --- | --- |
+| `clusters` 表 | `name`、`tiup_host/tiup_port/tiup_user/tiup_dir`、`db_host/db_port/db_user`、`pd_endpoint` |
+| `credentials` 表（AES-256-GCM 解密） | SSH 密码 / 私钥、DB 密码 |
+
+密码仅存在于 `Target` 内存结构；所有回传前端的错误消息都经 `sanitizeCredential()`（`user:pass@` → `user:***@`）处理，任务日志与探针结果不会泄漏凭据。
+
+#### 6.6.3 并行编排：10 个 goroutine
+
+`Collect` 用 `errgroup` 并发拉起下列任务，**每个 goroutine 的返回值恒为 nil**，错误只写入 `snap.ChanErrors[kind]`，因此单通道失败不会中断整体采集：
+
+| # | 任务 | 作用域开关 | 失败归类 |
+| --- | --- | --- | --- |
+| 1 | `ssh.FetchTiUPMeta` | `sc.Meta` | `KindSSH` |
+| 2 | `ssh.FetchHostResource`（中控机自身） | `sc.Hosts` | 不记错误（仅主机资源缺失） |
+| 3 | `mysql.FetchHostHardware`（集群内其余主机） | `sc.Hosts` | **不记错误**——硬件表是可选增强，失败只降级（见 §6.6.4） |
+| 4 | `mysql.FetchClusterInfo` | 始终执行 | `KindMySQL` |
+| 5 | `mysql.FetchUsers` | `sc.Users` | 不记错误 |
+| 6 | `mysql.FetchVariables` | `sc.Variables` | 不记错误 |
+| 7 | `mysql.FetchSessions` | `sc.Sessions` | 不记错误 |
+| 8 | `mysql.FetchResourceGroups` | `sc.RGs` | 低版本 `ErrUnsupported` 视为能力不足，不记错误 |
+| 9 | `mysql.Capabilities` | 始终执行 | 不记错误 |
+| 10 | `pd.FetchClusterStatus` + `FetchStores` | 始终执行 | `KindPD` |
+
+超时是两层叠加：整体 `TotalTimeout=15s` 的 `ctx`，每个 goroutine 再套自己的 `ChannelTimeout=10s`；上下文整体到期时 `Collect` 返回 error（任务失败），单通道到期只记一条通道错误。
+
+`Probe`（连接测试/接管前置探测）与 `Collect` 的区别：`Probe` 只返回**本次请求的 scope**，按 SSH → MySQL → PD 固定顺序，不返回「未执行该项探测」的占位项——调用方按下标取值，占位项会导致误判（该 bug 已由 `composite_probe_test.go` 锁定）。
+
+#### 6.6.4 三通道实现清单
+
+| 通道 | 入口 | 实际动作 |
+| --- | --- | --- |
+| SSH 拓扑 | `ssh.go:116 FetchTiUPMeta` | 三级取值（前一级成功即返回）：① `tiup cluster display <name> --format=json`（模板 `tiup_display_json`，`ParseDisplayJSON`，含 `cluster_version`/`dashboard_urls`/`grafana_urls` 与实例状态）→ ② `cat <tiup_dir>/storage/cluster/clusters/<name>/meta.yaml` + `yaml.Unmarshal` → ③ `tiup cluster display <name>` 文本输出（模板 `tiup_display`，`ParseDisplayText`，头部键值行 + 空格对齐表格）；三级全失败则聚合各级原因记通道错误。`Source` 字段标注本次来源 `display_json`/`meta_yaml`/`display_text` |
+| SSH 主机 | `ssh.go:210` | `arch` / `hostname` / `nproc` / `free -m` / `df -Pm`；CPU 使用率读两次 `/proc/stat` 间隔 200ms 求差。**只采中控机**这一台（其余主机无凭据，也不该逐台登录） |
+| MySQL 主机硬件 | `mysql.go:FetchHostHardware` | 一次查询覆盖集群内**所有**主机，无需逐台 SSH：① `information_schema.cluster_hardware`（`TYPE,INSTANCE,DEVICE_TYPE,DEVICE_NAME,NAME,VALUE`）取 `cpu/cpu-arch`、`cpu/cpu-logical-cores`（缺失退 `cpu-physical-cores`）、`memory/memory/capacity`（字节）、`disk/<设备>/path,total,used,used-percent`（按挂载点聚合、取 total 最大的那块盘）；② `information_schema.cluster_load` 取 `cpu/usage/idle`（使用率 =(1-idle)×100）与 `memory/virtual/used-percent`（×100，`memory/swap` 的 `NaN` 必须忽略）。`INSTANCE` 为真实地址（如 `10.10.10.10:4000`），`0.0.0.0` / `::` / 回环一律跳过（本机由 SSH 通道负责） |
+| MySQL 信息 | `mysql.go:124` | `information_schema.cluster_info` → 版本 + 实例数 + 主机数；不可用时退 `SELECT VERSION()` |
+| MySQL 账号 | `mysql.go:165` | `mysql.user`，先试含 `resource_group` 列（v7.5+），报错则降级为不含该列的查询 |
+| MySQL 参数 | `mysql.go:200` | `SHOW GLOBAL VARIABLES` + `cluster_config.default_value` 合并，得到「当前值 vs 默认值」 |
+| MySQL 会话 | `mysql.go:241` | ① `information_schema.cluster_processlist`（一次覆盖所有 TiDB 实例，带 `INSTANCE` 列）→ ② 权限或版本不足时退 `information_schema.processlist`，用当前连接地址兜底 `INSTANCE` |
+| MySQL 资源组 | `mysql.go:271` | `information_schema.resource_groups` + `mysql.user` 计数 |
+| MySQL 能力 | `mysql.go:100` | `SELECT VERSION()` 推版本门槛，再真实试探一次，产出 `supportsResourceGroup` 等布尔位 |
+| PD | `pd.go:152` | `GET /pd/api/v1/{cluster/status,version,stores,region/count,replication_mode/status}` |
+
+MySQL 每次 `Fetch*` 独立 `open()`（`mysql.go:39`，`InterpolateParams=false`、`MaxOpenConns=2`、用完即关），一次采集约 7 次建连握手。
+
+**使用率取值必须确定**：同一台主机上通常有多个实例（2379/4000/20160…），`cluster_load` 会给出多组使用率。取数规则固定为「① 优先 `TYPE='tidb'` 的实例；② 否则按 `INSTANCE` **字符串升序**取第一台」，且 CPU 与内存各自独立挑选（某台缺某指标时按同一顺序取下一个有值项）。禁止依赖 map 遍历顺序，否则同一台机器每次采集报出的使用率会随机漂移；`hardware_test` 里有 4 种输入顺序 ×5 次断言同一结果的回归用例。需要说明的是：使用率是**采集时刻的瞬时值**（`cluster_load` 每秒都会变，实测 2 核 VM 的 idle 一秒内可在 0.66~0.99 间跳动），跨两次采集数值不同属正常现象；同一份输入下结果恒定才是本节的约束范围。若产品需要「稳定读数」，应另行定义窗口均值/中位数语义，不要用单点值做真值比对。
+
+**主机硬件的失败降级**：`cluster_hardware` 查询失败（权限不足 / 版本裁剪）直接返回 error，由 `CompositeCollector` **吞掉**——`sc.Hosts` 分支里 SSH 与 MySQL 硬件是两个并行 goroutine，MySQL 硬件失败只是让其余主机的硬件留空（由 `synthesizeHosts` 补仅 IP 占位），**不会**记入 `ChanErrors[KindMySQL]`。这一点很关键：硬件表属于可选增强，若记成 MySQL 通道故障，`Derive` 会把本来健康的集群误判为 degraded/error。`cluster_load` 失败更轻，只跳过（使用率保持 0，硬件规格照常入库）。
+
+#### 6.6.5 归一化与多级兜底
+
+| 字段 | 优先级链 |
+| --- | --- |
+| 版本 | `tidb_version` → `cluster_version` → `version` → MySQL `cluster_info` → `SELECT VERSION()`；统一补 `v` 前缀 |
+| 架构 | `global.arch` → 任一 server 的 `arch` → `uname -m` 归一（`arm64`/`aarch64` → `aarch64`） |
+| PD 端口 | `port` → `client_port` → 2379 |
+| 实例状态 | meta 先写 `up`，再用 PD `stores[].state_name` 覆盖 TiKV 的真实状态 |
+| 主机数 | 实例 IP 去重；SSH 只采到 TiUP 主机时，其余主机补仅含 IP 的记录，保证实例数 ≥ 主机数自洽 |
+| 主机资源 | SSH（中控机实测）→ MySQL `cluster_hardware` / `cluster_load`（其余主机）→ 仅 IP 占位。逐层**字段级**补齐（`FillHostResources`：base 已有的值绝不被覆盖，只补空串 / 0），因此 SSH 的实测值优先、MySQL 只填空白 |
+| 实例/组件数 | 去重后条数 / 不同 `component` 种类数（含 `tiproxy`） |
+| 外部地址 | 按 server **实际端口**拼 `http://host:port`，去重后写 JSON 数组 |
+
+两条自愈逻辑：meta 完全不可用时用 PD stores 反推 TiKV 实例（拓扑不空白）；落库时若 `clusters.pd_endpoint` 为空，则用采到的 PD 实例回填，下次 PD 通道自动可用。
+
+#### 6.6.6 落库语义
+
+`PersistSnapshot` 是 `clusters.status / collect_status / collect_fail_streak` 的**唯一写入点**：
+
+1. 调 `collector.Derive()` 算健康状态（规则见 6.4）；
+2. 派生 `instance_count` / `host_count` / `component_count` 与版本、架构、四类外部地址；
+3. 一个事务内对 `instances / tidb_users / variables / sessions / resource_groups` **全量替换**（DELETE + INSERT），不做增量 diff——拓扑随时会变，全量替换的错误面更小；
+   **`hosts` 例外**：按 IP upsert，且只更新本次确实有值的字段（空串 / 0 一律跳过，`resource_fetched_at` 只在 arch/cpu_cores/memory_gb 有值时推进，`ssh_status` 只由 SSH 检测任务写）。原因见 §4.1：`hosts` 按 IP 全局唯一、多集群共享同一台机器，若某套集群这次采不到硬件就无条件覆盖，会把另一套集群刚写入的值抹掉；
+4. 只有「采到了东西」（实例/账号/参数非空）才 `Success=true` 覆盖旧数据，否则保留上次快照并累计失败计数。
+
+#### 6.6.6.1 会话的实时语义（`GET /clusters/:id/sessions?live=1`）
+
+会话是瞬时数据，采集快照只能代表上次采集那一刻。因此「会话」页面的刷新按钮走**实时查询**而不是重跑采集：
+
+| 环节 | 行为 |
+| --- | --- |
+| 查询 | `information_schema.cluster_processlist`，一次拿到全集群各 TiDB 实例的会话，带 `INSTANCE`（ip:port） |
+| 过滤/排序/分页 | 结果通常几十行，直接在内存完成（用户/来源/实例/库/SQL 关键词；默认 `TIME` 倒序，`sortBy=id` 时按 ID 升序） |
+| 写回 | 把**整份**实时结果替换 `sessions` 表缓存（不是当前页），Kill 仍按快照表取会话，不必再查一次库 |
+| 失败回退 | 连库失败 / 无权限 / 未配凭据时接口返回 50201（`reason` 带首行原因），页面提示后自动回退到上次采集快照 |
+| 演示模式 | 不连库，直接回放快照，`source=mock`、`live=false`，避免演示环境报错 |
+
+`cluster_processlist` 需要 `PROCESS` 权限且为 TiDB 4.0+；不可用时采集链路自动退回 `processlist`（只覆盖当前连接实例），`instance` 用连接地址兜底。
+Kill 走 `KILL TIDB <id>`（跨实例生效），失败再退回普通 `KILL <id>`。
+
+#### 6.6.7 接管（7 步）与刷新（5 步）的差异
+
+| 步骤 | 接管 `TypeTakeover` | 刷新 `TypeCollect` |
+| --- | --- | --- |
+| 1 | 参数校验（名称/地址/端口） | 能力探测（失败不阻塞） |
+| 2 | SSH 探测 —— 失败即中止 | 三通道全量采集 |
+| 3 | MySQL 探测 —— 失败即中止 | 统计 MySQL 对象数并记日志 |
+| 4 | PD 探测 —— 失败仅 warn | 统计 PD 状态并记日志 |
+| 5 | 全量采集 | 归一化落库 |
+| 6 | 落库 | — |
+| 7 | 收尾（演示模式额外提示） | — |
+
+接管卡死 SSH/MySQL 的原因：纳管一个连不上的集群只会生成空数据，不如当场报错让用户改地址；PD 允许缺失，因为很多环境未对平台开放 2379。
+
+#### 6.6.8 已知代价与优化方向
+
+| 现状 | 代价 | 何时需要优化 |
+| --- | --- | --- |
+| MySQL 每个 `Fetch*` 独立建连 | 一次采集 ~6 次握手（几十到一百多 ms） | 改成分钟级自动轮询时，应共享一个 `*sql.DB` |
+| SSH 每个 `Fetch*` 独立 `dial` | 2 次 SSH 建连（拓扑 + 主机） | 同上，可复用同一连接 |
+| 主机资源只采 TiUP 那一台 | 其余主机只有 IP，CPU/内存来自 `cluster_info` | 需要逐台监控时再加并发 SSH 池 |
+| CPU 使用率靠 200ms 双采样 | 阻塞该 goroutine 200ms | 改为 cgroup/`node_exporter` 接入 |
+
+#### 6.6.9 排错速查
+
+| 现象 | 定位 |
+| --- | --- |
+| 日志出现 `通道 ssh 采集失败` 但 MySQL 成功 | 集群 `degraded`，检查 `~/.tiup` 权限或 sshd |
+| 版本有值但实例数为 0 | `tiup cluster display` 输出未识别，按 6.3 补映射（注意文本路径 Host 列可能是主机名） |
+| `PD 返回 HTTP 404` | PD 地址填成了 TiDB 的 4000 端口，或集群走 TiProxy |
+| 全部通道失败且 `fail_streak` 达阈值 | 集群置 `error`，核对网络/凭据；凭据类错误仓库不重试 |
+| 界面状态与 `tiup cluster display` 不一致 | 先看详情页「采集快照 · 数据来源」：`meta.yaml` 说明 display 不可用、状态是默认值；再看顶部交叉校验告警。若来源是 `display_json` 仍有告警，说明 TiUP 那次探测失败，点「立即采集」重采一次即可 |
+| 主机页中控机显示 `0C / 0G`，其余主机正常 | 中控机是 macOS/非 Linux 环境：SSH 模板 `nproc`、`free`、`/proc/stat` 不存在（`arch`/`hostname`/`df` 仍可用），属环境限制；Linux 中控机不受影响 |
+| 主机页某台机器规格为空 | 先看该集群采集是否成功：硬件规格来自 `cluster_hardware`（需 `PROCESS` 权限），失败会静默降级为主机仅 IP 占位；补权限后重新采集即可，不会影响集群健康状态 |
+| 「会话」页数据很旧 | 点右上「刷新会话」：它走 `live=1` 实时查 `cluster_processlist`，不走采集任务；若提示「实时查询失败」，按返回的 `reason` 检查数据库凭据/网络/`PROCESS` 权限，页面此时展示的是上次采集快照 |
+| 点了「立即采集」/「刷新」数据没变 | 采集是异步任务，页面会在 `collecting` 归零后自动刷新（见 8.6）；若长期停在「采集中」，查任务中心该 job 是否卡住，或 `clusters.collecting` 是否被上次崩溃占位（进程重启会由 `job/recover.go` 复位） |
+
+**真实 TiUP 端到端用例（门控，默认不进 CI）**：`internal/collector/e2e_test.go` 带 `//go:build e2e`，需显式提供集群名才运行，环境不具备时 `t.Skip`：
+
+```bash
+cd backend
+TMP_E2E_CLUSTER=tidb-demo CGO_ENABLED=1 go test -tags e2e \
+  -ldflags=-linkmode=external -run TestE2E -v ./internal/collector/
+```
+
+它跑一次完整 `Collect`，只断言「`Source=display_json` + 实例数 + 版本/三类 URL 非空 + 实例 status 已透传」，不写死版本号与 IP；实例数可用 `TMP_E2E_INSTANCES` 覆盖（默认 5，对应 `tidb-demo`）。
 
 ---
 
@@ -1133,7 +1352,7 @@ stateDiagram-v2
 | `/clusters/takeover` | `views/cluster/Takeover.vue` | Global | A/O | 分步表单 |
 | `/clusters/:id` | → 重定向 `overview` | Cluster | A/O/V | — |
 | `/clusters/:id/overview` | `views/cluster/Overview.vue` | Cluster | A/O/V | 基础信息 + 拓扑缩略 |
-| `/clusters/:id/topology` | `views/cluster/Topology.vue` | Cluster | A/O/V | 全屏画布 |
+| `/clusters/:id/topology` | `views/cluster/Topology.vue` | Cluster | A/O/V | 默认「按主机」卡片（主机名/IP + SSH + 资源 + 该机实例清单），可切换「按组件」 |
 | `/clusters/:id/instances` | `views/cluster/Instances.vue` | Cluster | A/O/V | — |
 | `/clusters/:id/users` | `views/cluster/TiDBUsers.vue` | Cluster | A/O/V | 写操作按角色隐藏 |
 | `/clusters/:id/resource-groups` | `views/cluster/ResourceGroups.vue` | Cluster | A/O/V | 能力不满足时渲染 `Unsupported.vue` |
@@ -1201,6 +1420,21 @@ axios.create({ baseURL: import.meta.env.VITE_API_BASE + '/api/v1', timeout: 2000
 | QPS / 连接数 / 存储用量 / TiKV 水位 | 集群性能 | 多 `line`，`dataZoom` 可选 | `/clusters/:id/metrics`（P1） |
 | 主机资源趋势 | 主机详情 | 迷你 `line` ×3 | `/hosts/:id/metrics`（P1） |
 | 任务进度 | 任务详情 | 步骤时间线（`el-steps` + `el-timeline`，非 ECharts） | `/jobs/:id/steps` |
+
+### 8.6 数据刷新语义（「立即采集」「刷新」如何生效）
+
+采集是**异步任务**（`POST /clusters/:id/refresh` 返回 `202 + jobId`），所以「点完就重新请求」只会拿到旧快照。为保证界面上看到的一定是任务结束后的数据，前端按以下约定实现（`views/ClusterDetailView.vue`）：
+
+| 动作 | 行为 |
+| --- | --- |
+| 立即采集 | 提交任务 → 静默拉一次集群详情 → 若 `collecting=1` 则每 2s 轮询 `/clusters/:id`，按钮转为「采集中…」并禁用；`collecting` 归 0 后自增 `dataVersion`、弹出「采集完成/失败」提示。最长轮询 120s，超时提示改为手动刷新 |
+| 刷新 | `GET /clusters/:id` + 自增 `dataVersion`。Tab 内容通过 `:key="clusterId-activeTab-dataVersion"` 重建，从而**重新请求各自的接口**（此前只重载了父级详情，Tab 仍是旧数据，必须整页 F5） |
+| 兜底 | 任务极快结束时 `collecting` 可能已归 0，此时直接自增 `dataVersion` 并提示「已完成」 |
+| 轮询容错 | 轮询用 `silent` 模式，单次失败不清空页面、不弹全屏 loading，避免瞬时抖动把详情冲掉 |
+
+配套后端约束：`/api/v1` 全组挂 `NoCacheMiddleware`（`Cache-Control: no-store`），避免浏览器/代理缓存让「刷新」拿到旧 JSON；冒烟脚本 `[7.5]/[7.6]` 断言响应头禁缓存、`collecting` 能归零、`fetchedAt` 会前进。
+
+「访问入口」（Dashboard / Grafana / Prometheus / Alertmanager）统一用 `components/UrlLinks.vue` 渲染为 `target="_blank"` 外链，后端给的无协议头地址（如 `10.0.0.1:3000`）自动补 `http://`。
 
 ---
 
@@ -1289,7 +1523,7 @@ graph LR
 | JSON 字段 | 一律 camelCase（`clusterId`、`fetchedAt`、`passRate`），由 struct tag 控制；不使用 `snake_case` |
 | 分页 | 请求 `page/pageSize`；响应 `{list,total,page,pageSize}`；`pageSize` 上限 200 |
 | 空值 | Go `nil` → JSON `null`；前端展示统一 `—`；列表接口不返回 `password*`、`*_enc` |
-| 集群名唯一 | 应用层写入前 `name_lower=strings.ToLower(name)`；移除纳管时 `name_lower += "#removed#"+id`，释放唯一键 |
+| 集群名唯一 | 业务唯一键 = `(tiup_host, name_lower)`（`uk_clusters_host_name`）：**同一中控机内**集群名不可重复，不同中控机允许同名（同批机器跑多套集群）。应用层写入前 `name_lower=strings.ToLower(name)`；改名/换中控机时按**本次生效的中控机**校验；移除纳管时 `name_lower += "#removed#"+id`，释放唯一键 |
 | mock 契约 | `TMP_MOCK=true` 或 `settings.mode.mock=true` 启用 `MockCollector`；内置 3 套：`mock-prod-a`（v7.5.0/x86_64/DR AUTO SYNC/12 实例/含 TiFlash+TiCDC）、`mock-prod-b`（v6.5.4/x86_64/Majority/8 实例/无 RG 能力）、`mock-test-c`（v8.5.0/aarch64/Majority/5 实例/含 1 个 Down 节点触发降级）。写操作在 mock 下返回成功任务但仅改内存快照，响应统一带 `mock:true` 与「不会影响真实环境」提示；顶栏与总览双处展示模式标识 |
 | 日志 | `request_id` 贯穿 handler→service→collector；采集错误带 `cluster_id`、`channel`；密码类字段经 `Sanitize` |
 | 事务 | 快照落库（instances + 4 张快照表 + clusters 计数）在**同一事务**内全量替换；失败整体回滚，保留上次成功数据 |

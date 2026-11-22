@@ -1,5 +1,17 @@
 <template>
   <div v-loading="loading">
+    <el-alert
+      v-if="warnings.length"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="mb-12"
+    >
+      <template #title>采集状态需复核：TiUP 报告与平台实测存在矛盾</template>
+      <ul class="warn-list">
+        <li v-for="(w, i) in warnings" :key="i">{{ w }}</li>
+      </ul>
+    </el-alert>
     <el-row :gutter="16">
       <el-col :xs="24" :md="14">
         <h4 class="section-title">纳管信息</h4>
@@ -18,16 +30,20 @@
         <div class="detail-grid">
           <div class="detail-item">
             <span class="detail-label">Dashboard</span>
-            <span class="detail-value">
-              <template v-if="cluster?.dashboardUrls?.length">
-                <a v-for="url in cluster.dashboardUrls" :key="url" :href="url" target="_blank" class="link">{{ url }}</a>
-              </template>
-              <span v-else class="text-muted">—</span>
-            </span>
+            <span class="detail-value"><UrlLinks :urls="cluster?.dashboardUrls" /></span>
           </div>
-          <div class="detail-item"><span class="detail-label">Grafana</span><span class="detail-value mono">{{ (cluster?.grafanaUrls || []).join(', ') || '—' }}</span></div>
-          <div class="detail-item"><span class="detail-label">Prometheus</span><span class="detail-value mono">{{ (cluster?.prometheusUrls || []).join(', ') || '—' }}</span></div>
-          <div class="detail-item"><span class="detail-label">Alertmanager</span><span class="detail-value mono">{{ (cluster?.alertmanagerUrls || []).join(', ') || '—' }}</span></div>
+          <div class="detail-item">
+            <span class="detail-label">Grafana</span>
+            <span class="detail-value"><UrlLinks :urls="cluster?.grafanaUrls" /></span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">Prometheus</span>
+            <span class="detail-value"><UrlLinks :urls="cluster?.prometheusUrls" /></span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">Alertmanager</span>
+            <span class="detail-value"><UrlLinks :urls="cluster?.alertmanagerUrls" /></span>
+          </div>
         </div>
       </el-col>
 
@@ -63,6 +79,13 @@
         <h4 class="section-title mt-16">采集快照</h4>
         <div class="detail-grid">
           <div class="detail-item"><span class="detail-label">快照时间</span><span class="detail-value">{{ formatTime(overview?.fetchedAt) }}</span></div>
+          <div class="detail-item">
+            <span class="detail-label">数据来源</span>
+            <span class="detail-value">
+              {{ sourceLabel }}
+              <el-tag v-if="sourceDegraded" type="warning" size="small" effect="dark" class="ml">降级</el-tag>
+            </span>
+          </div>
           <div class="detail-item"><span class="detail-label">版本一致</span><span class="detail-value">{{ overview?.versionConsistent ? '是' : '否' }}</span></div>
           <div class="detail-item"><span class="detail-label">版本集合</span><span class="detail-value mono">{{ (overview?.versions || []).join(', ') || '—' }}</span></div>
           <div class="detail-item"><span class="detail-label">采集错误</span><span class="detail-value">{{ overview?.collectError || '无' }}</span></div>
@@ -118,6 +141,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import StatusTag from '@/components/StatusTag.vue'
+import UrlLinks from '@/components/UrlLinks.vue'
 import { clusterApi, type ClusterDetail, type ClusterOverview } from '@/api'
 import type { Capabilities, JobRow } from '@/api/types'
 import { formatTime } from '@/utils/format'
@@ -133,6 +157,22 @@ const overview = ref<ClusterOverview | null>(null)
 const cluster = computed<ClusterDetail | null>(() => overview.value?.cluster || null)
 const caps = computed<Capabilities | undefined>(() => cluster.value?.capabilities)
 const recentJobs = computed<JobRow[]>(() => overview.value?.recentJobs || [])
+
+/** 采集告警：TiUP 报告的实例状态与平台实测连通性矛盾。 */
+const warnings = computed<string[]>(() => cluster.value?.collectWarnings || [])
+const sourceDegraded = computed(() => cluster.value?.collectSource === 'meta_yaml')
+const sourceLabel = computed(() => {
+  switch (cluster.value?.collectSource) {
+    case 'display_json':
+      return 'tiup cluster display --format=json'
+    case 'display_text':
+      return 'tiup cluster display（文本）'
+    case 'meta_yaml':
+      return 'meta.yaml'
+    default:
+      return '—'
+  }
+})
 
 async function load(): Promise<void> {
   loading.value = true
@@ -178,5 +218,16 @@ onMounted(() => {
 
 .ml {
   margin-left: 8px;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
+}
+
+.warn-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>

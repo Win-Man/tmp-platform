@@ -124,7 +124,7 @@ func (r *TiDBObjRepo) ListSessions(ctx context.Context, clusterID int64, f Sessi
 	q := r.db.WithContext(ctx).Model(&model.Session{}).Where("cluster_id = ?", clusterID)
 	if kw := strings.TrimSpace(f.Keyword); kw != "" {
 		like := likePattern(kw)
-		q = q.Where("user_name LIKE ? ESCAPE '\\' OR host LIKE ? ESCAPE '\\' OR sql_digest LIKE ? ESCAPE '\\'", like, like, like)
+		q = q.Where("user_name LIKE ? ESCAPE '\\' OR host LIKE ? ESCAPE '\\' OR instance LIKE ? ESCAPE '\\' OR db LIKE ? ESCAPE '\\' OR sql_digest LIKE ? ESCAPE '\\'", like, like, like, like, like)
 	}
 	order := "time_sec DESC"
 	if f.SortBy == "id" {
@@ -142,6 +142,25 @@ func (r *TiDBObjRepo) GetSessionsByIDs(ctx context.Context, clusterID int64, ids
 	var list []model.Session
 	err := r.db.WithContext(ctx).Where("cluster_id = ? AND session_id IN ?", clusterID, ids).Find(&list).Error
 	return list, err
+}
+
+// ReplaceSessions 用实时结果整体替换某集群的会话缓存。
+//
+// 只动 sessions 表，不影响集群快照的其他部分与 last_collect_at；
+// 目的是让「会话」页面刷新后，Kill 等后续动作能查到这批会话。
+func (r *TiDBObjRepo) ReplaceSessions(ctx context.Context, clusterID int64, list []model.Session) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("cluster_id = ?", clusterID).Delete(&model.Session{}).Error; err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			return nil
+		}
+		for i := range list {
+			list[i].ClusterID = clusterID
+		}
+		return tx.CreateInBatches(list, 100).Error
+	})
 }
 
 // ListResourceGroups 查询 Resource Group 快照。

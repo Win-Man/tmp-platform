@@ -6,11 +6,15 @@ package sshcmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -26,19 +30,24 @@ var ErrUnknownTemplate = errors.New("sshcmd: 命令模板不在白名单内")
 var argRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
 // templates 预置命令模板。%s 为单个受限参数。
+//
+// 注意：`tiup cluster display` 在 TiUP 1.17 上不接受 `-T`
+// （报错 unknown shorthand flag: 'T'），且非 TTY 环境下本身就输出纯文本表格，
+// 因此文本模板不带格式参数。
 var templates = map[string]string{
-	"arch":         "uname -m",
-	"nproc":        "nproc",
-	"free":         "free -m",
-	"df":           "df -Pm",
-	"uptime":       "cat /proc/uptime",
-	"hostname":     "hostname",
-	"os_release":   "cat /etc/os-release",
-	"cat":          "cat %s",
-	"tiup_dir":     "ls -d %s",
-	"tiup_version": "tiup --version",
-	"tiup_display": "tiup cluster display %s -T",
-	"echo_ok":      "echo TMP_OK",
+	"arch":              "uname -m",
+	"nproc":             "nproc",
+	"free":              "free -m",
+	"df":                "df -Pm",
+	"uptime":            "cat /proc/uptime",
+	"hostname":          "hostname",
+	"os_release":        "cat /etc/os-release",
+	"cat":               "cat %s",
+	"tiup_dir":          "ls -d %s",
+	"tiup_version":      "tiup --version",
+	"tiup_display":      "tiup cluster display %s",
+	"tiup_display_json": "tiup cluster display %s --format=json",
+	"echo_ok":           "echo TMP_OK",
 }
 
 // Build 按模板名构造最终命令字符串；参数逐个校验字符白名单。
@@ -185,3 +194,89 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
+
+// IsLocalHost 判断 host 是否指向当前机器。
+//
+// 命中条件：回环地址 / localhost / 本机 hostname（含短名与 .local 后缀）/ 本机任一网卡 IP。
+// 用于「TiUP 与平台部署在同一台机器」的场景，此时无需 SSH，直接本地读元数据。
+func IsLocalHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return false
+	}
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0" {
+		return true
+	}
+	if name, err := os.Hostname(); err == nil && name != "" {
+		n := strings.ToLower(name)
+		if h == n || h == n+".local" || strings.Split(n, ".")[0] == strings.Split(h, ".")[0] {
+			return true
+		}
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() {
+			return true
+		}
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			return false
+		}
+		for _, iface := range ifaces {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(ip) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// LocalRunner 本地命令执行器（TiUP 与平台同机时使用，免 SSH）。
+//
+// 与 SSH Runner 共用同一套命令模板与参数白名单，因此安全约束一致。
+type LocalRunner struct {
+	timeout time.Duration
+}
+
+// NewLocalRunner 构造本地执行器。
+func NewLocalRunner(timeout time.Duration) *LocalRunner {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &LocalRunner{timeout: timeout}
+}
+
+// RunTemplate 执行白名单模板命令。
+func (l *LocalRunner) RunTemplate(template string, args ...string) (string, error) {
+	cmd, err := Build(template, args...)
+	if err != nil {
+		return "", err
+	}
+	return l.Run(cmd)
+}
+
+// Run 本地执行已构造好的（白名单）命令。
+func (l *LocalRunner) Run(cmd string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), l.timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	if err := c.Run(); err != nil {
+		if ctx.Err() != nil {
+			return stdout.String(), errors.New("sshcmd: 本地命令执行超时")
+		}
+		return stdout.String(), fmt.Errorf("sshcmd: 本地执行失败: %w (stderr: %s)", err, truncate(stderr.String(), 512))
+	}
+	return stdout.String(), nil
+}
+
+// Close 本地执行器无连接需要释放。
+func (l *LocalRunner) Close() error { return nil }

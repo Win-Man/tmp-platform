@@ -179,6 +179,60 @@ assert_eq "3" "$(jget "$BODY" "data.clusterTotal")" "总览集群总数"
 req GET "/api/v1/clusters/1/topology" "$AUTH"
 assert_eq "0" "$(jget "$BODY" "code")" "拓扑业务码"
 assert_nonempty "$(jget "$BODY" "data.groups")" "拓扑分组"
+# 拓扑主视角是「每台主机上有哪些实例」：实例必须自带 component，前端才能不依赖分组渲染。
+assert_nonempty "$(jget "$BODY" "data.hosts")" "拓扑按主机视角"
+assert_nonempty "$(jget "$BODY" "data.hosts.0.hostIp")" "拓扑首个主机 IP"
+assert_nonempty "$(jget "$BODY" "data.hosts.0.instances.0.component")" "主机下实例带 component"
+assert_nonempty "$(jget "$BODY" "data.hostCount")" "拓扑主机数"
+assert_nonempty "$(jget "$BODY" "data.nodeCount")" "拓扑实例数"
+
+echo ">> [7.5] 业务接口禁止缓存（Web 端「刷新」必须拿到新数据，不得依赖整页 F5）"
+curl -sS --noproxy '*' -D "$WORK/hdr" -o /dev/null "$BASE/api/v1/clusters?page=1&pageSize=1" -H "$AUTH" \
+  || die "请求失败：GET /api/v1/clusters"
+assert_contains "$(tr -d '\r' <"$WORK/hdr")" "Cache-Control: no-store" "业务接口响应头禁缓存"
+
+echo ">> [7.6] 立即采集：任务受理 → collecting 归零 → 快照时间前进"
+req GET "/api/v1/clusters/1/overview" "$AUTH"
+FETCHED_BEFORE="$(jget "$BODY" "data.fetchedAt")"
+assert_nonempty "$FETCHED_BEFORE" "采集前快照时间"
+req POST "/api/v1/clusters/1/refresh" "$AUTH"
+assert_eq "202" "$HTTP_CODE" "立即采集 HTTP 状态（异步受理）"
+assert_nonempty "$(jget "$BODY" "data.jobId")" "立即采集返回 jobId"
+COLLECT_DONE=false
+for _ in $(seq 1 40); do
+  req GET "/api/v1/clusters/1" "$AUTH"
+  case "$(jget "$BODY" "data.collecting")" in
+    "False" | "0")
+      COLLECT_DONE=true
+      break
+      ;;
+  esac
+  sleep 0.5
+done
+[ "$COLLECT_DONE" = "true" ] || die "采集任务 20s 内未释放 collecting 标记（前端会一直停在「采集中」）"
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "   [PASS] collecting 已归零，任务正常收尾"
+req GET "/api/v1/clusters/1/overview" "$AUTH"
+FETCHED_AFTER="$(jget "$BODY" "data.fetchedAt")"
+assert_nonempty "$FETCHED_AFTER" "采集后快照时间"
+if [ "$FETCHED_BEFORE" = "$FETCHED_AFTER" ]; then
+  echo "   [FAIL] 采集后快照时间未前进（仍为 ${FETCHED_BEFORE}）" >&2
+  echo ">> 冒烟失败，服务日志：${LOG}" >&2
+  exit 1
+fi
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "   [PASS] 快照时间已前进 -> ${FETCHED_AFTER}"
+
+echo ">> [7.7] 会话：快照可读，实时接口（live=1）在演示模式回放快照"
+req GET "/api/v1/clusters/1/sessions?page=1&pageSize=10" "$AUTH"
+assert_eq "0" "$(jget "$BODY" "code")" "会话快照业务码"
+assert_nonempty "$(jget "$BODY" "data.list")" "会话快照列表"
+# 会话来自集群级 cluster_processlist，必须带实例地址，前端才能按实例列展示。
+assert_nonempty "$(jget "$BODY" "data.list.0.instance")" "会话带实例地址"
+req GET "/api/v1/clusters/1/sessions?live=1&page=1&pageSize=10" "$AUTH"
+assert_eq "0" "$(jget "$BODY" "code")" "实时会话业务码"
+assert_eq "mock" "$(jget "$BODY" "data.source")" "演示模式实时来源标记"
+assert_eq "False" "$(jget "$BODY" "data.live")" "演示模式不冒充实时数据"
 
 echo ">> [8] SPA 深链回退（应 200 text/html）"
 req GET "/clusters"
@@ -287,6 +341,16 @@ echo ">> [13] 任务中心"
 req GET "/api/v1/jobs?page=1&pageSize=5" "$AUTH"
 assert_eq "0" "$(jget "$BODY" "code")" "任务列表业务码"
 assert_nonempty "$(jget "$BODY" "data.list.0.status")" "任务列表首条状态"
+
+echo ">> [13.5] 演示数据可辨识（mockMode / demo 标记 / 提示语）"
+req GET "/api/v1/auth/me" "$AUTH"
+assert_eq "True" "$(jget "$BODY" "data.mockMode")" "/auth/me 返回 mockMode=true"
+req GET "/api/v1/clusters?page=1&pageSize=10" "$AUTH"
+assert_eq "True" "$(jget "$BODY" "data.list.0.demo")" "演示模式下的集群带 demo 标记"
+req POST "/api/v1/clusters/test-connection" "$AUTH" \
+  '{"name":"smoke-demo-check","tiupHost":"10.99.0.1","tiupUser":"dba","sshPassword":"x","dbHost":"10.99.0.1","dbPort":4000,"dbUser":"root","dbPassword":"x","pdEndpoint":""}'
+assert_eq "True" "$(jget "$BODY" "data.demo")" "连接测试返回 demo=true"
+assert_nonempty "$(jget "$BODY" "data.notice")" "连接测试返回「未连接真实集群」提示语"
 
 # 放在最后：本用例会把 admin 锁定 10 分钟，不影响前面的鉴权请求。
 echo ">> [14] 登录失败锁定（连续 5 次错误密码，第 5 次应 42901）"

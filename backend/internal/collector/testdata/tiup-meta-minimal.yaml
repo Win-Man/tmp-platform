@@ -1,0 +1,77 @@
+# 真实 TiUP meta.yaml 结构样本（取自 1 TiDB + 1 TiKV + 1 PD + Prometheus + Grafana 的最小集群，已脱敏）。
+# 关键点：版本键是 tidb_version；PD 用 client_port/peer_port；arch 写在服务级而非 global。
+user: dba
+tidb_version: v8.5.5
+topology:
+  global:
+    user: dba
+    ssh_port: 22
+    ssh_type: builtin
+    deploy_dir: /tidb-deploy
+    data_dir: /tidb-data
+    os: linux
+    systemd_mode: system
+  monitored:
+    node_exporter_port: 9100
+    blackbox_exporter_port: 9115
+    deploy_dir: /tidb-deploy/monitored-9100
+    data_dir: /tidb-data/monitored-9100
+    log_dir: /tidb-deploy/monitored-9100/log
+  server_configs:
+    tidb: {}
+    tikv: {}
+    pd: {}
+  tidb_servers:
+    - host: 10.10.10.10
+      ssh_port: 22
+      port: 4000
+      status_port: 10080
+      deploy_dir: /tidb-deploy/tidb-4000
+      log_dir: /tidb-deploy/tidb-4000/log
+      arch: arm64
+      os: linux
+  tikv_servers:
+    - host: 10.10.10.10
+      ssh_port: 22
+      port: 20160
+      status_port: 20180
+      deploy_dir: /tidb-deploy/tikv-20160
+      data_dir: /tidb-data/tikv-20160
+      log_dir: /tidb-deploy/tikv-20160/log
+      arch: arm64
+      os: linux
+  tiflash_servers: []
+  tiproxy_servers: []
+  pd_servers:
+    - host: 10.10.10.10
+      ssh_port: 22
+      name: pd-10.10.10.10-2379
+      client_port: 2379
+      peer_port: 2380
+      deploy_dir: /tidb-deploy/pd-2379
+      data_dir: /tidb-data/pd-2379
+      log_dir: /tidb-deploy/pd-2379/log
+      arch: arm64
+      os: linux
+  monitoring_servers:
+    - host: 10.10.10.11
+      ssh_port: 22
+      port: 9090
+      ng_port: 12020
+      deploy_dir: /tidb-deploy/prometheus-9090
+      data_dir: /tidb-data/prometheus-9090
+      log_dir: /tidb-deploy/prometheus-9090/log
+      external_alertmanagers: []
+      arch: arm64
+      os: linux
+  grafana_servers:
+    - host: 10.10.10.11
+      ssh_port: 22
+      port: 3000
+      deploy_dir: /tidb-deploy/grafana-3000
+      arch: arm64
+      os: linux
+      username: admin
+      anonymous_enable: false
+      root_url: ""
+      domain: ""

@@ -1,0 +1,16 @@
+Cluster type:       tidb
+Cluster name:       tidb-demo
+Cluster version:    v8.5.5
+Deploy user:        dba
+SSH type:           builtin
+Dashboard URL:      http://10.10.10.10:2379/dashboard
+Dashboard URLs:     http://10.10.10.10:2379/dashboard
+Grafana URL:        http://10.10.10.11:3000
+ID                 Role        Host         Ports                 OS/Arch        Status   Data Dir                    Deploy Dir
+--                 ----        ----         -----                 -------        ------   --------                    ----------
+10.10.10.11:3000   grafana     10.10.10.11  3000                  linux/aarch64  Up       -                           /tidb-deploy/grafana-3000
+10.10.10.10:2379   pd          10.10.10.10  2379/2380             linux/aarch64  Up|L|UI  /tidb-data/pd-2379          /tidb-deploy/pd-2379
+10.10.10.11:9090   prometheus  10.10.10.11  9090/9105/9100/12020  linux/aarch64  Up       /tidb-data/prometheus-9090  /tidb-deploy/prometheus-9090
+10.10.10.10:4000   tidb        10.10.10.10  4000/10080            linux/aarch64  Up       -                           /tidb-deploy/tidb-4000
+10.10.10.10:20160  tikv        10.10.10.10  20160/20180           linux/aarch64  Up       /tidb-data/tikv-20160       /tidb-deploy/tikv-20160
+Total nodes: 5

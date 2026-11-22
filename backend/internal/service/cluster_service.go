@@ -88,6 +88,7 @@ type ClusterBrief struct {
 	ID                int64  `json:"id"`
 	Name              string `json:"name"`
 	Draft             bool   `json:"draft"`
+	Demo              bool   `json:"demo"`
 	TiDBVersion       string `json:"tidbVersion"`
 	DeployMode        string `json:"deployMode"`
 	CPUArch           string `json:"cpuArch"`
@@ -110,7 +111,11 @@ type ClusterBrief struct {
 	LastSuccessAt         *time.Time `json:"lastSuccessAt"`
 	FetchedAt             *time.Time `json:"fetchedAt"`
 	LastCollectError      string     `json:"lastCollectError"`
-	CreatedAt             time.Time  `json:"createdAt"`
+	// CollectSource 最近一次采集的元数据来源（display_json / display_text / meta_yaml）。
+	CollectSource string `json:"collectSource"`
+	// CollectWarnings 最近一次采集的交叉校验告警（TiUP 报告状态与实测连通性矛盾）。
+	CollectWarnings []string  `json:"collectWarnings"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 // CredentialMask 凭据掩码视图。
@@ -143,6 +148,7 @@ func ToBrief(c *model.Cluster) ClusterBrief {
 		ID:                c.ID,
 		Name:              c.Name,
 		Draft:             c.Draft == 1,
+		Demo:              c.IsDemo == 1,
 		TiDBVersion:       c.TiDBVersion,
 		DeployMode:        c.DeployMode,
 		CPUArch:           c.CPUArch,
@@ -161,6 +167,8 @@ func ToBrief(c *model.Cluster) ClusterBrief {
 		LastSuccessAt:     c.LastSuccessAt,
 		FetchedAt:         c.FetchedAt,
 		LastCollectError:  c.LastCollectError,
+		CollectSource:     c.CollectSource,
+		CollectWarnings:   parseStringList(c.CollectWarnings),
 		CreatedAt:         c.CreatedAt,
 	}
 }
@@ -175,6 +183,18 @@ func parseURLList(raw string) []string {
 		return []string{}
 	}
 	if out == nil {
+		return []string{}
+	}
+	return out
+}
+
+// parseStringList 解析 JSON 字符串数组（采集告警等），空值或解析失败返回空切片。
+func parseStringList(raw string) []string {
+	out := []string{}
+	if strings.TrimSpace(raw) == "" {
+		return out
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
 		return []string{}
 	}
 	return out
@@ -220,12 +240,15 @@ func (s *ClusterService) List(ctx context.Context, f repo.ClusterFilter) (*repo.
 }
 
 // ClusterOption 下拉选项。
+//
+// TiUPHost 用于区分「同名不同中控机」的集群（多套集群可能同名）。
 type ClusterOption struct {
 	ID          int64  `json:"id"`
 	Name        string `json:"name"`
 	Status      string `json:"status"`
 	TiDBVersion string `json:"tidbVersion"`
 	Draft       bool   `json:"draft"`
+	TiUPHost    string `json:"tiupHost"`
 }
 
 // Options 下拉用精简列表。
@@ -236,7 +259,14 @@ func (s *ClusterService) Options(ctx context.Context) ([]ClusterOption, error) {
 	}
 	out := make([]ClusterOption, 0, len(list))
 	for _, c := range list {
-		out = append(out, ClusterOption{ID: c.ID, Name: c.Name, Status: c.Status, TiDBVersion: c.TiDBVersion, Draft: c.Draft == 1})
+		out = append(out, ClusterOption{
+			ID:          c.ID,
+			Name:        c.Name,
+			Status:      c.Status,
+			TiDBVersion: c.TiDBVersion,
+			Draft:       c.Draft == 1,
+			TiUPHost:    c.TiUPHost,
+		})
 	}
 	return out, nil
 }
@@ -632,6 +662,16 @@ type TakeoverResult struct {
 	Draft     bool  `json:"draft"`
 	// Forced 本次是否为「跳过连接测试」的强制接管。
 	Forced bool `json:"forced"`
+	// Demo 演示模式接管：采集结果为内置样例，不代表真实集群。
+	Demo bool `json:"demo"`
+}
+
+// duplicateClusterNameMsg 重复纳管的统一文案。
+//
+// 唯一键是 (tiup_host, name_lower)，因此提示必须点明「该中控机上」，
+// 否则用户无法理解为什么别的中控机有同名集群却不算冲突。
+func duplicateClusterNameMsg(name string) string {
+	return fmt.Sprintf("该中控机上已存在同名集群「%s」（不区分大小写）", strings.TrimSpace(name))
 }
 
 // Takeover 接管集群：入参校验 → 连接测试凭证校验 → 落库 → 加密存凭据 → 提交异步接管采集任务。
@@ -692,8 +732,11 @@ func (s *ClusterService) Takeover(ctx context.Context, in TakeoverInput, operato
 	}
 
 	nameLower := strings.ToLower(name)
-	if existing, err := s.clusters.GetByNameLower(ctx, nameLower); err == nil && existing != nil {
-		return nil, apperr.BadRequest("集群名已存在（不区分大小写）")
+	tiupHost := strings.TrimSpace(in.TiUPHost)
+	// 唯一键是「中控机 + 集群名」：不同中控机上允许同名集群（同批机器跑多套集群），
+	// 只有同一台中控机上的同名集群才算重复纳管。
+	if existing, err := s.clusters.GetByHostAndNameLower(ctx, tiupHost, nameLower); err == nil && existing != nil {
+		return nil, apperr.BadRequest(duplicateClusterNameMsg(name))
 	} else if err != nil && !errors.Is(err, repo.ErrNotFound) {
 		return nil, apperr.Internal("校验集群名失败")
 	}
@@ -708,12 +751,18 @@ func (s *ClusterService) Takeover(ctx context.Context, in TakeoverInput, operato
 	if in.SaveAsDraft {
 		draft = 1
 	}
+	mockMode := s.mode != nil && s.mode.IsMock()
+	isDemo := 0
+	if mockMode {
+		isDemo = 1
+	}
 	c := &model.Cluster{
 		Name:           name,
 		NameLower:      nameLower,
 		Draft:          draft,
+		IsDemo:         isDemo,
 		DeployMode:     model.DeployModeUnknown,
-		TiUPHost:       strings.TrimSpace(in.TiUPHost),
+		TiUPHost:       tiupHost,
 		TiUPPort:       tiupPort,
 		TiUPUser:       strings.TrimSpace(in.TiUPUser),
 		TiUPDir:        strings.TrimSpace(in.TiUPDir),
@@ -739,7 +788,7 @@ func (s *ClusterService) Takeover(ctx context.Context, in TakeoverInput, operato
 		return nil, err
 	}
 
-	res := &TakeoverResult{ClusterID: c.ID, Draft: in.SaveAsDraft, Forced: forced}
+	res := &TakeoverResult{ClusterID: c.ID, Draft: in.SaveAsDraft, Forced: forced, Demo: mockMode}
 	if in.SaveAsDraft {
 		return res, nil
 	}
@@ -857,13 +906,30 @@ func (s *ClusterService) Update(ctx context.Context, id int64, in UpdateInput) (
 		"updated_at":     time.Now(),
 		"collect_status": model.ClusterStatusDegraded,
 	}
-	if strings.TrimSpace(in.Name) != "" && in.Name != c.Name {
-		newLower := strings.ToLower(strings.TrimSpace(in.Name))
-		if other, err := s.clusters.GetByNameLower(ctx, newLower); err == nil && other.ID != c.ID {
-			return nil, apperr.BadRequest("集群名已存在（不区分大小写）")
+	// 唯一性校验：业务唯一键是 (tiup_host, name_lower)，因此「改名」和「换中控机」
+	// 都可能产生冲突，两者任一变化都要按**本次生效的**中控机 + 名字校验。
+	newName := strings.TrimSpace(in.Name)
+	newHost := strings.TrimSpace(in.TiUPHost)
+	nameChanged := newName != "" && newName != c.Name
+	hostChanged := newHost != "" && newHost != strings.TrimSpace(c.TiUPHost)
+	if nameChanged || hostChanged {
+		targetHost := strings.TrimSpace(c.TiUPHost)
+		targetName := c.Name
+		targetLower := c.NameLower
+		if hostChanged {
+			targetHost = newHost
 		}
-		fields["name"] = strings.TrimSpace(in.Name)
-		fields["name_lower"] = newLower
+		if nameChanged {
+			targetName = newName
+			targetLower = strings.ToLower(newName)
+		}
+		if other, err := s.clusters.GetByHostAndNameLower(ctx, targetHost, targetLower); err == nil && other != nil && other.ID != c.ID {
+			return nil, apperr.BadRequest(duplicateClusterNameMsg(targetName))
+		}
+		if nameChanged {
+			fields["name"] = newName
+			fields["name_lower"] = targetLower
+		}
 	}
 	if in.TiUPHost != "" {
 		fields["tiup_host"] = in.TiUPHost
@@ -1005,7 +1071,7 @@ func (s *ClusterService) PersistSnapshot(ctx context.Context, clusterID int64, s
 	}
 	threshold := s.settings.ErrorStreak(ctx)
 	everSucceeded := c.LastSuccessAt != nil
-	status, collectStatus, streak := collector.Derive(snap.ChanErrors, c.CollectFailStreak, everSucceeded, threshold)
+	status, collectStatus, streak := collector.Derive(snap.ChanErrors, c.CollectFailStreak, everSucceeded, threshold, snap.DownInstances())
 
 	write := &repo.SnapshotWrite{
 		ClusterID:     clusterID,
@@ -1013,6 +1079,8 @@ func (s *ClusterService) PersistSnapshot(ctx context.Context, clusterID int64, s
 		CollectStatus: collectStatus,
 		FailStreak:    streak,
 		Success:       len(snap.ChanErrors) == 0 || status != model.ClusterStatusError,
+		Source:        snap.Source,
+		Warnings:      snap.Consistency,
 		FetchedAt:     snap.FetchedAt,
 	}
 	if write.FetchedAt.IsZero() {
@@ -1156,6 +1224,7 @@ func (s *ClusterService) PersistSnapshot(ctx context.Context, clusterID int64, s
 		write.Sessions = append(write.Sessions, model.Session{
 			ClusterID: clusterID,
 			SessionID: se.ID,
+			Instance:  se.Instance,
 			UserName:  se.UserName,
 			Host:      se.Host,
 			DB:        se.DB,
@@ -1281,10 +1350,11 @@ func (s *ClusterService) Overview(ctx context.Context, id int64) (*ClusterOvervi
 	}, nil
 }
 
-// TopologyNode 拓扑节点。
+// TopologyNode 拓扑节点（一个实例）。
 type TopologyNode struct {
 	ID         int64  `json:"id"`
 	HostIP     string `json:"hostIp"`
+	Component  string `json:"component"`
 	Port       int    `json:"port"`
 	StatusPort int    `json:"statusPort"`
 	Status     string `json:"status"`
@@ -1293,14 +1363,38 @@ type TopologyNode struct {
 	AZ         string `json:"az"`
 }
 
-// TopologyGroup 拓扑分组。
+// TopologyGroup 按组件分组的拓扑。
 type TopologyGroup struct {
 	Component string         `json:"component"`
 	Nodes     []TopologyNode `json:"nodes"`
 }
 
+// TopologyHost 按主机聚合的拓扑：一台主机上承载了哪些实例。
+type TopologyHost struct {
+	HostIP        string  `json:"hostIp"`
+	Hostname      string  `json:"hostname"`
+	SSHStatus     string  `json:"sshStatus"`
+	CPUCores      int     `json:"cpuCores"`
+	MemoryGB      float64 `json:"memoryGb"`
+	InstanceCount int     `json:"instanceCount"`
+	// Components 该主机上出现的组件（去重、按组件序），便于前端直接渲染标签。
+	Components []string       `json:"components"`
+	Instances  []TopologyNode `json:"instances"`
+}
+
+// TopologyResult 拓扑聚合结果：同一份数据给出「按主机」与「按组件」两个视角。
+type TopologyResult struct {
+	Hosts     []TopologyHost  `json:"hosts"`
+	Groups    []TopologyGroup `json:"groups"`
+	NodeCount int             `json:"nodeCount"`
+	HostCount int             `json:"hostCount"`
+}
+
 // Topology 返回拓扑图数据（节点数恒等于实例数）。
-func (s *ClusterService) Topology(ctx context.Context, id int64) ([]TopologyGroup, error) {
+//
+// 以「主机 → 实例」为主视角（用户真正关心的是某台机器上跑着什么），
+// 同时保留按组件分组的视角，前端可切换。
+func (s *ClusterService) Topology(ctx context.Context, id int64) (*TopologyResult, error) {
 	if _, err := s.clusters.GetByID(ctx, id); err != nil {
 		return nil, apperr.NotFound("集群不存在")
 	}
@@ -1308,29 +1402,109 @@ func (s *ClusterService) Topology(ctx context.Context, id int64) ([]TopologyGrou
 	if err != nil {
 		return nil, apperr.Internal("查询实例失败")
 	}
+
 	byComp := map[string][]TopologyNode{}
-	order := []string{}
+	compOrder := []string{}
+	byHost := map[string][]TopologyNode{}
+	hostOrder := []string{}
 	for _, inst := range list {
-		if _, ok := byComp[inst.Component]; !ok {
-			order = append(order, inst.Component)
-		}
-		byComp[inst.Component] = append(byComp[inst.Component], TopologyNode{
+		node := TopologyNode{
 			ID:         inst.ID,
 			HostIP:     inst.HostIP,
+			Component:  inst.Component,
 			Port:       inst.Port,
 			StatusPort: inst.StatusPort,
 			Status:     inst.Status,
 			Role:       inst.Role,
 			Version:    inst.Version,
 			AZ:         inst.AZ,
+		}
+		if _, ok := byComp[inst.Component]; !ok {
+			compOrder = append(compOrder, inst.Component)
+		}
+		byComp[inst.Component] = append(byComp[inst.Component], node)
+
+		ip := strings.TrimSpace(inst.HostIP)
+		if ip == "" {
+			ip = "unknown"
+		}
+		if _, ok := byHost[ip]; !ok {
+			hostOrder = append(hostOrder, ip)
+		}
+		byHost[ip] = append(byHost[ip], node)
+	}
+	sort.SliceStable(compOrder, func(i, j int) bool {
+		return componentSortKey(compOrder[i]) < componentSortKey(compOrder[j])
+	})
+	// 同一主机内的实例按「组件业务序 + 端口」排列，读起来才像一份部署清单。
+	for ip := range byHost {
+		nodes := byHost[ip]
+		sort.SliceStable(nodes, func(i, j int) bool {
+			ki, kj := componentSortKey(nodes[i].Component), componentSortKey(nodes[j].Component)
+			if ki != kj {
+				return ki < kj
+			}
+			return nodes[i].Port < nodes[j].Port
 		})
+		byHost[ip] = nodes
 	}
-	sort.SliceStable(order, func(i, j int) bool { return componentSortKey(order[i]) < componentSortKey(order[j]) })
-	out := make([]TopologyGroup, 0, len(order))
-	for _, comp := range order {
-		out = append(out, TopologyGroup{Component: comp, Nodes: byComp[comp]})
+
+	// 主机元信息（主机名 / SSH / CPU / 内存）按 IP 关联，取不到就用占位值。
+	metaByIP := map[string]model.Host{}
+	if hosts, herr := s.hosts.ListByCluster(ctx, id); herr == nil {
+		for _, h := range hosts {
+			metaByIP[h.IP] = h
+		}
 	}
-	return out, nil
+
+	sort.SliceStable(hostOrder, func(i, j int) bool { return ipLess(hostOrder[i], hostOrder[j]) })
+	res := &TopologyResult{
+		Hosts:     make([]TopologyHost, 0, len(hostOrder)),
+		Groups:    make([]TopologyGroup, 0, len(compOrder)),
+		NodeCount: len(list),
+		HostCount: len(hostOrder),
+	}
+	for _, ip := range hostOrder {
+		nodes := byHost[ip]
+		h := TopologyHost{HostIP: ip, InstanceCount: len(nodes), Instances: nodes}
+		if m, ok := metaByIP[ip]; ok {
+			h.Hostname = m.Hostname
+			h.SSHStatus = m.SSHStatus
+			h.CPUCores = m.CPUCores
+			h.MemoryGB = m.MemoryGB
+		}
+		seen := map[string]bool{}
+		comps := make([]string, 0, 4)
+		for _, n := range nodes {
+			if !seen[n.Component] {
+				seen[n.Component] = true
+				comps = append(comps, n.Component)
+			}
+		}
+		sort.SliceStable(comps, func(i, j int) bool { return componentSortKey(comps[i]) < componentSortKey(comps[j]) })
+		h.Components = comps
+		res.Hosts = append(res.Hosts, h)
+	}
+	for _, comp := range compOrder {
+		res.Groups = append(res.Groups, TopologyGroup{Component: comp, Nodes: byComp[comp]})
+	}
+	return res, nil
+}
+
+// ipLess 按数值段比较 IP，避免 10.0.0.10 排在 10.0.0.9 前面。
+func ipLess(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		na, ea := strconv.Atoi(pa[i])
+		nb, eb := strconv.Atoi(pb[i])
+		if ea != nil || eb != nil {
+			break
+		}
+		if na != nb {
+			return na < nb
+		}
+	}
+	return a < b
 }
 
 // componentSortKey 组件排序键。
@@ -1534,9 +1708,11 @@ func (s *ClusterService) SeedMockClusters(ctx context.Context) ([]int64, error) 
 	ids := make([]int64, 0, len(specs))
 	for _, sp := range specs {
 		c := &model.Cluster{
-			Name:          sp.name,
-			NameLower:     strings.ToLower(sp.name),
-			Draft:         0,
+			Name:      sp.name,
+			NameLower: strings.ToLower(sp.name),
+			Draft:     0,
+			// 内置演示集群同样打上演示标记，列表与详情会显示「演示数据」。
+			IsDemo:        1,
 			TiDBVersion:   sp.version,
 			DeployMode:    model.DeployModeUnknown,
 			CPUArch:       "x86_64",

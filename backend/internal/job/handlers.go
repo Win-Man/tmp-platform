@@ -181,14 +181,29 @@ func (e *Engine) handleTakeover(ctx context.Context, r *Runner) error {
 }
 
 // clusterStatusOf 描述快照健康状态（仅日志展示用）。
+//
+// 直接复用 collector.Derive，保证日志口径与库里的 clusters.status 永远同源，
+// 不在任务层重复实现判定规则（例如「仅 PD 失败不降级」）。
 func clusterStatusOf(snap *collector.Snapshot) string {
 	if snap == nil {
 		return "unknown"
 	}
-	if len(snap.ChanErrors) == 0 {
-		return "healthy"
+	status, _, _ := collector.Derive(snap.ChanErrors, 0, true, 3, snap.DownInstances())
+	return status
+}
+
+// describeMetaSource 把采集来源标识翻译成任务日志里可读的中文描述。
+func describeMetaSource(source string) string {
+	switch source {
+	case collector.DisplaySourceJSON:
+		return "tiup cluster display --format=json"
+	case collector.DisplaySourceText:
+		return "tiup cluster display 文本输出"
+	case collector.MetaSourceYAML:
+		return "meta.yaml（降级）"
+	default:
+		return "未知来源"
 	}
-	return "degraded"
 }
 
 // ---------------------------------------------------------------------------
@@ -241,9 +256,17 @@ func (e *Engine) handleCollect(ctx context.Context, r *Runner) error {
 			return fmt.Errorf("采集失败: %w", cerr)
 		}
 		snap = s
-		r.Logf(2000, "SSH 通道：解析到 %d 个实例、%d 台主机", len(s.Instances), len(s.Hosts))
+		r.Logf(2000, "SSH 通道：元数据来源 %s，解析到 %d 个实例、%d 台主机",
+			describeMetaSource(s.Source), len(s.Instances), len(s.Hosts))
 		if msg, bad := s.ChanErrors[collector.KindSSH]; bad {
 			r.Log(2000, "warn", "SSH 通道失败：%s", msg)
+		} else if s.Source == collector.MetaSourceYAML {
+			// meta.yaml 不含实例运行状态，全部按默认 up 填写 —— 必须显式告警，
+			// 否则界面上「全绿」会被误读为集群确实健康。
+			r.Log(2000, "warn", "已降级读取 meta.yaml（tiup cluster display 不可用）：meta.yaml 不含实例运行状态，本次实例状态为默认值 up，不能作为故障判断依据")
+		}
+		for _, msg := range s.Consistency {
+			r.Log(2000, "warn", "状态交叉校验：%s", msg)
 		}
 		return nil
 	}); derr != nil {
@@ -772,11 +795,15 @@ func (e *Engine) handleKillSession(ctx context.Context, r *Runner) error {
 		for i, s := range sessions {
 			sess := s
 			subErr := r.RunSubStep(2, fmt.Sprintf("KILL %d", sess.SessionID), func() error {
-				stmt := fmt.Sprintf("KILL %d", sess.SessionID)
+				// 会话来自集群级 cluster_processlist，可能不在当前连接的实例上，
+				// 因此先试 KILL TIDB（跨实例生效），失败再退回普通 KILL。
+				stmt := fmt.Sprintf("KILL TIDB %d", sess.SessionID)
 				if xerr := col.Exec(ctx, target, collector.Statement{SQL: stmt}); xerr != nil {
-					return xerr
+					if ferr := col.Exec(ctx, target, collector.Statement{SQL: fmt.Sprintf("KILL %d", sess.SessionID)}); ferr != nil {
+						return ferr
+					}
 				}
-				r.Logf(2000, "会话 %d（%s）已 Kill", sess.SessionID, sess.UserName)
+				r.Logf(2000, "会话 %d（%s@%s）已 Kill", sess.SessionID, sess.UserName, sess.Instance)
 				return nil
 			})
 			if subErr != nil {

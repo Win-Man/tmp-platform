@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tmp-platform/backend/internal/collector"
 	"github.com/tmp-platform/backend/internal/crypto"
@@ -460,6 +461,132 @@ func (s *TiDBObjService) KillSessions(ctx context.Context, clusterID int64, sess
 		return 0, err
 	}
 	return jobID, nil
+}
+
+// SessionsResult 会话列表结果（快照或实时同构）。
+type SessionsResult struct {
+	List      []model.Session `json:"list"`
+	Total     int64           `json:"total"`
+	Page      int             `json:"page"`
+	PageSize  int             `json:"pageSize"`
+	Live      bool            `json:"live"`
+	Source    string          `json:"source"`
+	FetchedAt time.Time       `json:"fetchedAt"`
+}
+
+// RefreshSessions 实时查询 information_schema.cluster_processlist。
+//
+// 会话天然是瞬时数据，快照只能代表上次采集那一刻，因此「刷新」走这条路径：
+// 直接连库读全集群 sessions，过滤/排序/分页在内存完成，并顺手把结果写回
+// sessions 表（Kill 等后续动作仍按快照表取会话，不必再查一次库）。
+func (s *TiDBObjService) RefreshSessions(ctx context.Context, clusterID int64, f repo.SessionFilter) (*SessionsResult, error) {
+	if s.mode.IsMock() {
+		// 演示模式没有真实数据库可连，回放快照，避免页面直接报错。
+		snap, err := s.ListSessions(ctx, clusterID, f)
+		if err != nil {
+			return nil, err
+		}
+		return &SessionsResult{
+			List: snap.List, Total: snap.Total, Page: snap.Page, PageSize: snap.PageSize,
+			Source: "mock", FetchedAt: time.Now(),
+		}, nil
+	}
+	_, t, err := s.target(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, collector.ChannelTimeout)
+	defer cancel()
+	rows, ferr := collector.NewMySQLChannel(collector.ChannelTimeout).FetchSessions(cctx, t)
+	if ferr != nil {
+		return nil, apperr.CollectFailed("实时查询会话失败", map[string]any{
+			"reason": firstLine(ferr.Error()),
+		})
+	}
+
+	now := time.Now()
+	f.Page.Normalize()
+	pageRows, total, all := buildSessionPage(clusterID, rows, f, now)
+
+	// 写回快照（尽力而为）：写整份实时结果而不是当前页，否则翻页会把缓存覆盖成 20 条，
+	// Kill 等按快照表取会话的动作就会找不到目标。失败不影响本次返回，下次采集会覆盖。
+	_ = s.obj.ReplaceSessions(ctx, clusterID, all)
+
+	return &SessionsResult{
+		List: pageRows, Total: total, Page: f.Page.Page, PageSize: f.Page.PageSize,
+		Live: true, Source: "cluster_processlist", FetchedAt: now,
+	}, nil
+}
+
+// buildSessionPage 对实时结果做关键词过滤 → 排序 → 分页，
+// 同时返回过滤后的全量列表（用于写回快照）。
+//
+// 抽成纯函数：集群级 processlist 通常只有几十行，内存处理比拼 SQL 简单，
+// 也方便单测覆盖过滤与排序规则。
+func buildSessionPage(clusterID int64, rows []collector.SessionRow, f repo.SessionFilter, now time.Time) ([]model.Session, int64, []model.Session) {
+	f.Page.Normalize()
+	kw := strings.ToLower(strings.TrimSpace(f.Keyword))
+	filtered := make([]model.Session, 0, len(rows))
+	for _, r := range rows {
+		if kw != "" && !sessionMatches(r, kw) {
+			continue
+		}
+		filtered = append(filtered, model.Session{
+			ClusterID: clusterID,
+			SessionID: r.ID,
+			Instance:  r.Instance,
+			UserName:  r.UserName,
+			Host:      r.Host,
+			DB:        r.DB,
+			Command:   r.Command,
+			TimeSec:   r.TimeSec,
+			State:     r.State,
+			SQLDigest: r.SQLDigest,
+			FetchedAt: now,
+			CreatedAt: now,
+		})
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if f.SortBy == "id" {
+			return filtered[i].SessionID < filtered[j].SessionID
+		}
+		return filtered[i].TimeSec > filtered[j].TimeSec
+	})
+
+	total := int64(len(filtered))
+	start := f.Page.Offset()
+	if start > len(filtered) {
+		start = len(filtered)
+	}
+	end := start + f.Page.PageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[start:end], total, filtered
+}
+
+// sessionMatches 会话关键词匹配：用户 / 来源 / 实例 / 库 / SQL。
+func sessionMatches(r collector.SessionRow, kw string) bool {
+	for _, s := range []string{r.UserName, r.Host, r.Instance, r.DB, r.SQLDigest} {
+		if s != "" && strings.Contains(strings.ToLower(s), kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstLine 取错误首行并截断，避免把多行驱动错误整条抛给前端。
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = s[:i]
+	}
+	const max = 200
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
 }
 
 // ListVariables 分页查询参数快照。

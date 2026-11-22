@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -53,10 +54,16 @@ func (r *ClusterRepo) GetByIDWithDeleted(ctx context.Context, id int64) (*model.
 	return &c, nil
 }
 
-// GetByNameLower 按小写名查询，用于唯一性校验。
-func (r *ClusterRepo) GetByNameLower(ctx context.Context, nameLower string) (*model.Cluster, error) {
+// GetByHostAndNameLower 按「中控机 + 小写集群名」查询，用于唯一性校验。
+//
+// 集群的业务唯一键是 (tiup_host, name_lower)：不同中控机上可以有同名集群
+// （同一批机器部署多套 TiDB 集群是常见形态），只有同一台中控机上的同名才算重复。
+// 软删除行由 GORM 的 deleted_at 条件自动排除，语义与移除纳管后「可重新接管」一致。
+func (r *ClusterRepo) GetByHostAndNameLower(ctx context.Context, tiupHost, nameLower string) (*model.Cluster, error) {
 	var c model.Cluster
-	err := r.db.WithContext(ctx).Where("name_lower = ?", nameLower).First(&c).Error
+	err := r.db.WithContext(ctx).
+		Where("tiup_host = ? AND name_lower = ?", tiupHost, nameLower).
+		First(&c).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrNotFound
 	}
@@ -144,9 +151,12 @@ func (r *ClusterRepo) All(ctx context.Context) ([]model.Cluster, error) {
 }
 
 // Options 下拉用精简列表。
+//
+// 带上 tiup_host：不同中控机上允许同名集群，下拉项必须能区分（name @ tiupHost）。
 func (r *ClusterRepo) Options(ctx context.Context) ([]model.Cluster, error) {
 	var list []model.Cluster
-	err := r.db.WithContext(ctx).Select("id", "name", "status", "tidb_version", "draft").Order("name ASC").Find(&list).Error
+	err := r.db.WithContext(ctx).Select("id", "name", "status", "tidb_version", "draft", "tiup_host").
+		Order("name ASC").Find(&list).Error
 	return list, err
 }
 
@@ -348,7 +358,11 @@ type SnapshotWrite struct {
 	Success       bool
 	ErrorMessage  string
 	Capabilities  string
-	FetchedAt     time.Time
+	// Source 元数据采集来源（display_json / display_text / meta_yaml）。
+	Source string
+	// Warnings 交叉校验告警（写入 clusters.collect_warnings，空则清空）。
+	Warnings  []string
+	FetchedAt time.Time
 
 	// PDEndpoint 非空时表示需要把 PD 地址回填到 clusters（仅当库内为空，故不会覆盖手填值）。
 	PDEndpoint string
@@ -385,19 +399,48 @@ func (r *ClusterRepo) ApplySnapshot(ctx context.Context, w *SnapshotWrite) error
 				return err
 			default:
 				hostIDs[h.IP] = existing.ID
-				if uerr := tx.Model(&model.Host{}).Where("id = ?", existing.ID).Updates(map[string]any{
-					"hostname":            h.Hostname,
-					"os_user":             h.OSUser,
-					"cpu_arch":            h.CPUArch,
-					"cpu_cores":           h.CPUCores,
-					"memory_gb":           h.MemoryGB,
-					"disk_total_gb":       h.DiskTotalGB,
-					"cpu_usage_pct":       h.CPUUsagePct,
-					"mem_usage_pct":       h.MemUsagePct,
-					"disk_usage_pct":      h.DiskUsagePct,
-					"resource_fetched_at": h.ResourceFetchedAt,
-					"updated_at":          time.Now(),
-				}).Error; uerr != nil {
+				// 多集群共享同一台主机时，hosts 行按 IP 全局唯一：某套集群采不到硬件
+				//（值为空 / 0）绝不能把另一套集群刚写入的值抹掉，因此只更新「本次确实有值」
+				// 的字段；ssh_status 只由 SSH 检测任务写，快照永不覆盖。
+				updates := map[string]any{"updated_at": time.Now()}
+				if h.Hostname != "" {
+					updates["hostname"] = h.Hostname
+				}
+				if h.OSUser != "" {
+					updates["os_user"] = h.OSUser
+				}
+				if h.CPUArch != "" {
+					updates["cpu_arch"] = h.CPUArch
+				}
+				if h.CPUCores > 0 {
+					updates["cpu_cores"] = h.CPUCores
+				}
+				if h.MemoryGB > 0 {
+					updates["memory_gb"] = h.MemoryGB
+				}
+				if h.DiskTotalGB > 0 {
+					updates["disk_total_gb"] = h.DiskTotalGB
+				}
+				if h.CPUUsagePct > 0 {
+					updates["cpu_usage_pct"] = h.CPUUsagePct
+				}
+				if h.MemUsagePct > 0 {
+					updates["mem_usage_pct"] = h.MemUsagePct
+				}
+				if h.DiskUsagePct > 0 {
+					updates["disk_usage_pct"] = h.DiskUsagePct
+				}
+				// resource_fetched_at 只在本批次确实带来硬件信息时推进，
+				// 避免「这次只拿到 IP」把资源采集时间刷成最新、误导用户以为硬件刚采过。
+				if h.CPUArch != "" || h.CPUCores > 0 || h.MemoryGB > 0 {
+					at := h.ResourceFetchedAt
+					if at == nil {
+						now := time.Now()
+						at = &now
+					}
+					updates["resource_fetched_at"] = at
+				}
+				if uerr := tx.Model(&model.Host{}).Where("id = ?", existing.ID).Updates(updates).Error; uerr != nil {
 					return uerr
 				}
 			}
@@ -470,12 +513,21 @@ func (r *ClusterRepo) ApplySnapshot(ctx context.Context, w *SnapshotWrite) error
 		}
 
 		// 4) 集群状态与计数（唯一写入口）。
+		// 交叉校验告警每次都要写：本次没有矛盾时必须清空，否则旧的「状态存疑」
+		// 提示会一直挂在界面上，反而变成新的误导。
+		warnRaw := ""
+		if len(w.Warnings) > 0 {
+			if b, jerr := json.Marshal(w.Warnings); jerr == nil {
+				warnRaw = string(b)
+			}
+		}
 		fields := map[string]any{
 			"status":              w.Status,
 			"collect_status":      w.CollectStatus,
 			"collect_fail_streak": w.FailStreak,
 			"last_collect_at":     w.FetchedAt,
 			"last_collect_error":  w.ErrorMessage,
+			"collect_warnings":    warnRaw,
 			"collecting":          0,
 			"updated_at":          time.Now(),
 		}
@@ -508,6 +560,9 @@ func (r *ClusterRepo) ApplySnapshot(ctx context.Context, w *SnapshotWrite) error
 			}
 			if w.Capabilities != "" {
 				fields["capabilities"] = w.Capabilities
+			}
+			if w.Source != "" {
+				fields["collect_source"] = w.Source
 			}
 			// PD 地址自愈：只在库内为空时写入（WHERE 条件保证），不覆盖用户手填值。
 			if w.PDEndpoint != "" {

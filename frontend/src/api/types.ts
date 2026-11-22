@@ -1,5 +1,7 @@
 /** 领域模型类型定义（与后端 JSON 字段严格对应）。 */
 
+import type { PageData } from './http'
+
 export type ClusterStatus = 'healthy' | 'degraded' | 'error' | 'unknown'
 export type CollectStatus = 'healthy' | 'degraded' | 'error' | 'unknown'
 export type JobStatus = 'pending' | 'running' | 'success' | 'failed' | 'canceled' | 'interrupted'
@@ -65,6 +67,8 @@ export interface ClusterBrief {
   id: number
   name: string
   draft: boolean
+  /** 演示模式采集的集群（内置样例数据，非真实集群）。 */
+  demo: boolean
   tidbVersion: string
   deployMode: string
   cpuArch: string
@@ -87,6 +91,10 @@ export interface ClusterBrief {
   lastSuccessAt?: string | null
   fetchedAt?: string | null
   lastCollectError?: string
+  /** 最近一次采集的元数据来源：display_json / display_text / meta_yaml。 */
+  collectSource?: string
+  /** 交叉校验告警：TiUP 报告的实例状态与平台实测连通性矛盾时逐条记录。 */
+  collectWarnings?: string[]
   createdAt?: string
 }
 
@@ -94,11 +102,17 @@ export interface ClusterOption {
   id: number
   name: string
   status: ClusterStatus
+  /** 中控机地址：不同中控机上允许存在同名集群，下拉项需要靠它区分。 */
+  tiupHost?: string
+  tidbVersion?: string
+  draft?: boolean
 }
 
 export interface TopologyNode {
   id: number
   hostIp: string
+  /** 实例所属组件（pd / tidb / tikv / ...），按主机视角渲染时必需。 */
+  component: string
   port: number
   statusPort: number
   status: string
@@ -111,6 +125,26 @@ export interface TopologyGroup {
   component: string
   nodes: TopologyNode[]
   nodeCount?: number
+}
+
+/** 按主机聚合的拓扑：一台主机承载的所有实例。 */
+export interface TopologyHost {
+  hostIp: string
+  hostname: string
+  /** ok / fail / unknown */
+  sshStatus: string
+  cpuCores: number
+  memoryGb: number
+  instanceCount: number
+  components: string[]
+  instances: TopologyNode[]
+}
+
+export interface TopologyResult {
+  hosts: TopologyHost[]
+  groups: TopologyGroup[]
+  nodeCount: number
+  hostCount: number
 }
 
 export interface InstanceRow {
@@ -169,14 +203,22 @@ export interface SessionRow {
   id: number
   clusterId: number
   sessionId: number
+  /** 会话所在 TiDB 实例（ip:port），来自 cluster_processlist.INSTANCE。 */
+  instance?: string
   userName: string
   host: string
   db?: string
   command: string
   timeSec: number
   state?: string
-  sqlText?: string
-  longQuery?: boolean
+  sqlDigest?: string
+  fetchedAt?: string
+}
+
+/** 会话列表：live=true 表示实时查询结果。 */
+export interface SessionsPage extends PageData<SessionRow> {
+  live?: boolean
+  source?: string
   fetchedAt?: string
 }
 
@@ -191,6 +233,13 @@ export interface VariableRow {
   description?: string
   differs: number
   fetchedAt?: string
+}
+
+/** 主机所属集群的精简信息（含中控机，用于区分同名集群）。 */
+export interface HostClusterBrief {
+  id: number
+  name: string
+  tiupHost: string
 }
 
 export interface HostRow {
@@ -213,6 +262,8 @@ export interface HostRow {
   roles?: string[]
   clusterNames?: string[]
   clusterIds?: number[]
+  /** 所属集群明细：一台主机可同时属于多套集群，且不同中控机上可能有同名集群。 */
+  clusters?: HostClusterBrief[]
 }
 
 export interface JobRow {

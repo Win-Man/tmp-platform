@@ -350,10 +350,10 @@ func fixtureProdA() *mockFixture {
 			"tidb_scatter_region":           "ON",
 		}),
 		sessions: []SessionRow{
-			{ID: 10501, UserName: "app_order", Host: "10.20.5.31:52344", DB: "order_db", Command: "Query", TimeSec: 182, State: "statistics", SQLDigest: "SELECT o.id, o.amount FROM orders o JOIN order_item i ON o.id=i.order_id WHERE o.created_at > ?"},
-			{ID: 10502, UserName: "app_pay", Host: "10.20.5.32:41120", DB: "pay_db", Command: "Sleep", TimeSec: 12, State: "", SQLDigest: ""},
-			{ID: 10503, UserName: "readonly_bi", Host: "10.20.6.7:33022", DB: "dw", Command: "Query", TimeSec: 75, State: "coprocessor", SQLDigest: "SELECT count(*) FROM fact_trade WHERE dt = ?"},
-			{ID: 10504, UserName: "app_order", Host: "10.20.5.33:39210", DB: "order_db", Command: "Query", TimeSec: 3, State: "autocommit", SQLDigest: "INSERT INTO order_log (id, msg) VALUES (?, ?)"},
+			{ID: 10501, Instance: "10.20.1.11:4000", UserName: "app_order", Host: "10.20.5.31:52344", DB: "order_db", Command: "Query", TimeSec: 182, State: "statistics", SQLDigest: "SELECT o.id, o.amount FROM orders o JOIN order_item i ON o.id=i.order_id WHERE o.created_at > ?"},
+			{ID: 10502, Instance: "10.20.1.11:4000", UserName: "app_pay", Host: "10.20.5.32:41120", DB: "pay_db", Command: "Sleep", TimeSec: 12, State: "", SQLDigest: ""},
+			{ID: 10503, Instance: "10.20.1.12:4000", UserName: "readonly_bi", Host: "10.20.6.7:33022", DB: "dw", Command: "Query", TimeSec: 75, State: "coprocessor", SQLDigest: "SELECT count(*) FROM fact_trade WHERE dt = ?"},
+			{ID: 10504, Instance: "10.20.1.12:4000", UserName: "app_order", Host: "10.20.5.33:39210", DB: "order_db", Command: "Query", TimeSec: 3, State: "autocommit", SQLDigest: "INSERT INTO order_log (id, msg) VALUES (?, ?)"},
 		},
 		rgs: []RGRow{
 			{Name: "default", RUPerSec: "UNLIMITED", Priority: "MEDIUM", Burstable: false, UserCount: 4, Status: "running"},
@@ -394,8 +394,8 @@ func fixtureProdB() *mockFixture {
 			"tidb_enable_async_commit": "OFF",
 		}),
 		sessions: []SessionRow{
-			{ID: 2401, UserName: "app_crm", Host: "10.30.9.11:51022", DB: "crm", Command: "Query", TimeSec: 320, State: "coprocessor", SQLDigest: "SELECT * FROM customer WHERE phone LIKE ?"},
-			{ID: 2402, UserName: "report_user", Host: "10.30.9.12:41880", DB: "crm", Command: "Sleep", TimeSec: 5, State: "", SQLDigest: ""},
+			{ID: 2401, Instance: "10.30.2.21:4000", UserName: "app_crm", Host: "10.30.9.11:51022", DB: "crm", Command: "Query", TimeSec: 320, State: "coprocessor", SQLDigest: "SELECT * FROM customer WHERE phone LIKE ?"},
+			{ID: 2402, Instance: "10.30.2.21:4000", UserName: "report_user", Host: "10.30.9.12:41880", DB: "crm", Command: "Sleep", TimeSec: 5, State: "", SQLDigest: ""},
 		},
 		// v6.5 不提供 Resource Group，返回空集合。
 		rgs: nil,
@@ -430,7 +430,7 @@ func fixtureTestC() *mockFixture {
 			"tidb_server_memory_limit": "32GB",
 		}),
 		sessions: []SessionRow{
-			{ID: 3311, UserName: "tester", Host: "10.40.9.21:60122", DB: "test", Command: "Query", TimeSec: 91, State: "hashagg", SQLDigest: "SELECT /*+ hash_agg */ t.id, count(*) FROM t GROUP BY t.id"},
+			{ID: 3311, Instance: "10.40.3.31:4000", UserName: "tester", Host: "10.40.9.21:60122", DB: "test", Command: "Query", TimeSec: 91, State: "hashagg", SQLDigest: "SELECT /*+ hash_agg */ t.id, count(*) FROM t GROUP BY t.id"},
 		},
 		rgs: []RGRow{
 			{Name: "default", RUPerSec: "UNLIMITED", Priority: "MEDIUM", Burstable: false, UserCount: 1, Status: "running"},

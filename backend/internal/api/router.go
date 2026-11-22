@@ -52,6 +52,8 @@ func NewRouter(d RouterDeps) *gin.Engine {
 
 	h := d.Handlers
 	v1 := r.Group("/api/v1")
+	// 接口数据（集群状态、采集快照）不可缓存，否则刷新按钮拿到的仍是旧值。
+	v1.Use(NoCacheMiddleware())
 
 	// ---- 公开接口：初始化状态、初始化、登录 ----
 	v1.GET("/setup/status", h.SetupStatus)

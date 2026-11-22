@@ -6,11 +6,12 @@
           <el-button text :icon="ArrowLeft" @click="router.push('/clusters')">返回</el-button>
           <h2 class="page-title">{{ cluster?.name || '集群详情' }}</h2>
           <StatusTag v-if="cluster" :status="cluster.status" />
+          <el-tag v-if="cluster?.demo" type="danger" effect="dark" size="small">演示数据</el-tag>
           <el-tag v-if="cluster?.draft" type="info" effect="plain" size="small">草稿</el-tag>
           <el-tag v-if="cluster?.collecting" type="warning" effect="plain" size="small">采集中</el-tag>
         </div>
         <p class="page-desc">
-          <span class="mono">{{ cluster?.tiupHost }}:{{ cluster?.tiupPort }}</span>
+          <span class="mono">中控机 {{ cluster ? `${cluster.tiupHost}:${cluster.tiupPort}` : '—' }}</span>
           · TiDB {{ cluster?.tidbVersion || '—' }}
           · {{ enums.label('deployMode', cluster?.deployMode || 'unknown') }}
           · 最近采集 {{ formatTime(cluster?.lastCollectAt) }}
@@ -21,11 +22,11 @@
         <el-button
           v-if="auth.can('cluster.refresh')"
           type="primary"
-          :loading="refreshing"
+          :loading="refreshing || polling"
           :disabled="cluster?.draft"
           @click="refreshCollect"
         >
-          立即采集
+          {{ polling ? '采集中…' : '立即采集' }}
         </el-button>
       </div>
     </div>
@@ -40,6 +41,15 @@
     >
       <el-button size="small" @click="reload">重试</el-button>
     </el-alert>
+
+    <el-alert
+      v-if="cluster?.demo"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="mb-12"
+      title="演示数据：该集群拓扑、实例、用户与巡检结果均为内置样例，不代表真实环境"
+    />
 
     <el-alert
       v-if="cluster?.lastCollectError"
@@ -57,8 +67,10 @@
       </el-tabs>
 
       <router-view v-slot="{ Component }">
+        <!-- dataVersion 变化时重建当前 Tab，强制其重新拉取接口数据（刷新/采集完成） -->
         <component
           :is="Component"
+          :key="`${clusterId}-${activeTab}-${dataVersion}`"
           :caps="activeTab === 'users' ? cluster?.capabilities : undefined"
           @change-tab="onChangeTab"
         />
@@ -68,7 +80,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowLeft, Refresh } from '@element-plus/icons-vue'
@@ -88,6 +100,16 @@ const cluster = ref<ClusterDetail | null>(null)
 const loading = ref(false)
 const refreshing = ref(false)
 const errorMessage = ref('')
+
+/** 数据版本号：自增后当前 Tab 组件会重建，从而重新请求自身接口。 */
+const dataVersion = ref(0)
+/** 是否处于「等待采集任务完成」的轮询中。 */
+const polling = ref(false)
+
+const POLL_INTERVAL = 2000
+const POLL_MAX_MS = 120000
+let pollTimer: number | undefined
+let pollElapsed = 0
 
 /** Tab 定义：name 必须与子路由 path 段一致（/clusters/:id/<name>）。 */
 const allTabs = [
@@ -120,33 +142,77 @@ const activeTab = computed<string>({
   },
 })
 
-async function loadCluster(): Promise<void> {
+async function loadCluster(silent = false): Promise<void> {
   if (!clusterId.value) {
     return
   }
-  loading.value = true
-  errorMessage.value = ''
+  if (!silent) {
+    loading.value = true
+    errorMessage.value = ''
+  }
   try {
     cluster.value = await clusterApi.get(clusterId.value)
   } catch (err) {
-    // 失败时清空，避免用上一个集群的详情冒充当前集群。
-    cluster.value = null
-    errorMessage.value = err instanceof Error ? err.message : '请求失败'
+    // 静默轮询偶发失败不清空页面，避免一次抖动把详情冲掉。
+    if (!silent) {
+      // 失败时清空，避免用上一个集群的详情冒充当前集群。
+      cluster.value = null
+      errorMessage.value = err instanceof Error ? err.message : '请求失败'
+    }
   } finally {
-    loading.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
 }
 
+/** 刷新：父级详情 + 当前 Tab 内容一起重取（Tab 靠 key 重建）。 */
 async function reload(): Promise<void> {
   await loadCluster()
+  dataVersion.value++
+}
+
+function stopPolling(): void {
+  if (pollTimer !== undefined) {
+    window.clearInterval(pollTimer)
+    pollTimer = undefined
+  }
+  polling.value = false
+}
+
+/** 采集任务异步执行，轮询集群详情直到 collecting 归零。 */
+function startPolling(): void {
+  if (pollTimer !== undefined) {
+    return
+  }
+  polling.value = true
+  pollElapsed = 0
+  pollTimer = window.setInterval(() => {
+    pollElapsed += POLL_INTERVAL
+    if (pollElapsed > POLL_MAX_MS) {
+      stopPolling()
+      ElMessage.warning('采集耗时较长，已停止自动刷新，请稍后手动点「刷新」')
+      return
+    }
+    void loadCluster(true)
+  }, POLL_INTERVAL)
 }
 
 async function refreshCollect(): Promise<void> {
   refreshing.value = true
   try {
     const res = await clusterApi.refresh(clusterId.value)
-    ElMessage.success(res.reused ? `已有进行中任务 #${res.jobId}` : `采集任务 #${res.jobId} 已提交`)
-    await loadCluster()
+    await loadCluster(true)
+    if (cluster.value?.collecting) {
+      startPolling()
+      ElMessage.info(
+        res.reused ? `已有进行中任务 #${res.jobId}，完成后自动刷新` : `采集任务 #${res.jobId} 已提交，完成后自动刷新`,
+      )
+    } else {
+      // 任务极快结束时 collecting 已归零，直接刷新页面数据。
+      dataVersion.value++
+      ElMessage.success(`采集任务 #${res.jobId} 已完成`)
+    }
   } finally {
     refreshing.value = false
   }
@@ -157,9 +223,32 @@ function onChangeTab(name: string): void {
   activeTab.value = name
 }
 
+/** collecting 由 1 归 0 说明采集任务结束：自动刷新详情与当前 Tab。 */
+watch(
+  () => cluster.value?.collecting,
+  (collecting) => {
+    if (collecting) {
+      startPolling()
+      return
+    }
+    const wasPolling = pollTimer !== undefined
+    stopPolling()
+    if (!wasPolling) {
+      return
+    }
+    dataVersion.value++
+    if (cluster.value?.lastCollectError) {
+      ElMessage.error(`采集失败：${cluster.value.lastCollectError}`)
+    } else {
+      ElMessage.success('采集完成，数据已更新')
+    }
+  },
+)
+
 watch(
   () => route.params.id,
   () => {
+    stopPolling()
     void loadCluster()
   },
 )
@@ -167,6 +256,10 @@ watch(
 onMounted(async () => {
   await enums.ensure()
   await loadCluster()
+})
+
+onBeforeUnmount(() => {
+  stopPolling()
 })
 </script>
 

@@ -193,6 +193,9 @@ func (h *Handlers) bindRG(c *gin.Context, bind bool) {
 }
 
 // ListSessions GET /api/v1/clusters/:id/sessions
+//
+// live=1 时实时查询 information_schema.cluster_processlist（页面刷新按钮），
+// 否则读取上次采集的会话快照。
 func (h *Handlers) ListSessions(c *gin.Context) {
 	id, ok := Int64Param(c, "id")
 	if !ok {
@@ -202,6 +205,15 @@ func (h *Handlers) ListSessions(c *gin.Context) {
 		Keyword: rawQuery(c, "keyword"),
 		SortBy:  rawQuery(c, "sortBy"),
 		Page:    PageParams(c),
+	}
+	if BoolQuery(c, "live") {
+		res, err := h.TiDBObj.RefreshSessions(c.Request.Context(), id, f)
+		if err != nil {
+			Fail(c, err)
+			return
+		}
+		OK(c, res)
+		return
 	}
 	res, err := h.TiDBObj.ListSessions(c.Request.Context(), id, f)
 	if err != nil {

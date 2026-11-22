@@ -28,8 +28,10 @@ import type {
   ResourceGroupRow,
   RoleMatrixRow,
   SessionRow,
+  SessionsPage,
   TiDBUserRow,
   TopologyGroup,
+  TopologyResult,
   UserProfile,
   VariableRow,
 } from './types'
@@ -152,6 +154,10 @@ export interface TestConnectionResponse {
   results: ProbeResult[]
   testToken: string
   mock: boolean
+  /** 演示模式：结果为内置样例，未连接真实集群。 */
+  demo?: boolean
+  /** 演示模式提示语（后端给出，直接展示给用户）。 */
+  notice?: string
   /** 表单未填 PD 地址时，服务端自动发现的结果（发现失败时为 null）。 */
   discovered?: PDDiscovery | null
 }
@@ -222,7 +228,13 @@ export const clusterApi = {
   discoverPD: (data: Partial<TakeoverForm>) =>
     request<PDDiscovery>({ url: '/clusters/discover-pd', method: 'post', data, timeout: 20000 }),
   create: (data: TakeoverForm) =>
-    request<{ clusterId: number; jobId: number; forced?: boolean }>({ url: '/clusters', method: 'post', data }),
+    request<{
+      clusterId: number
+      jobId: number
+      forced?: boolean
+      demo?: boolean
+      notice?: string
+    }>({ url: '/clusters', method: 'post', data }),
   get: (id: number) => request<ClusterDetail>({ url: `/clusters/${id}`, method: 'get' }),
   update: (id: number, data: Partial<TakeoverForm>) =>
     request<null>({ url: `/clusters/${id}`, method: 'put', data }),
@@ -232,8 +244,7 @@ export const clusterApi = {
   batchRefresh: (ids: number[]) =>
     request<RefreshResult[]>({ url: '/clusters/batch-refresh', method: 'post', data: { ids } }),
   overview: (id: number) => request<ClusterOverview>({ url: `/clusters/${id}/overview`, method: 'get' }),
-  topology: (id: number) =>
-    request<{ groups: TopologyGroup[] }>({ url: `/clusters/${id}/topology`, method: 'get' }),
+  topology: (id: number) => request<TopologyResult>({ url: `/clusters/${id}/topology`, method: 'get' }),
   instances: (id: number, params: Record<string, unknown>) =>
     request<PageData<InstanceRow>>({ url: `/clusters/${id}/instances`, method: 'get', params }),
   components: (id: number) =>
@@ -289,8 +300,17 @@ export const tidbApi = {
     request<null>({ url: `/clusters/${id}/resource-groups/bind`, method: 'post', data }),
   unbindRG: (id: number, data: { userName: string; host: string }) =>
     request<null>({ url: `/clusters/${id}/resource-groups/unbind`, method: 'post', data }),
+  /** 会话快照（上次采集结果）。 */
   sessions: (id: number, params: Record<string, unknown>) =>
-    request<PageData<SessionRow>>({ url: `/clusters/${id}/sessions`, method: 'get', params }),
+    request<SessionsPage>({ url: `/clusters/${id}/sessions`, method: 'get', params }),
+  /** 实时查询 information_schema.cluster_processlist（silent=true 时不弹全局错误条，由页面兜底提示）。 */
+  refreshSessions: (id: number, params: Record<string, unknown>, silent = false) =>
+    request<SessionsPage>({
+      url: `/clusters/${id}/sessions`,
+      method: 'get',
+      params: { ...params, live: 1 },
+      headers: silent ? { 'X-TMP-Silent': '1' } : undefined,
+    }),
   killSessions: (id: number, sessionIds: number[]) =>
     request<{ jobId: number }>({ url: `/clusters/${id}/sessions/kill`, method: 'post', data: { sessionIds } }),
   variables: (id: number, params: Record<string, unknown>) =>

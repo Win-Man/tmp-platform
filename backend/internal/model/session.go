@@ -4,9 +4,12 @@ import "time"
 
 // Session processlist 会话快照。
 type Session struct {
-	ID        int64     `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
-	ClusterID int64     `gorm:"column:cluster_id;not null" json:"clusterId"`
-	SessionID int64     `gorm:"column:session_id;not null" json:"sessionId"`
+	ID        int64 `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
+	ClusterID int64 `gorm:"column:cluster_id;not null" json:"clusterId"`
+	SessionID int64 `gorm:"column:session_id;not null" json:"sessionId"`
+	// Instance 会话所在 TiDB 实例（ip:port）。集群级 cluster_processlist 下
+	// session_id 仅实例内唯一，必须与 instance 一起才能定位一条会话。
+	Instance  string    `gorm:"column:instance;type:text" json:"instance"`
 	UserName  string    `gorm:"column:user_name;type:text" json:"userName"`
 	Host      string    `gorm:"column:host;type:text" json:"host"`
 	DB        string    `gorm:"column:db;type:text" json:"db"`

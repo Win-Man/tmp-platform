@@ -42,6 +42,16 @@ type HostFilter struct {
 	Page      Page
 }
 
+// HostClusterBrief 主机所属集群的精简信息。
+//
+// 多套集群可以共享同一批机器，且不同中控机上允许存在同名集群，
+// 因此必须带上 tiupHost 才能在界面上区分「同名不同中控机」的两个集群。
+type HostClusterBrief struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	TiUPHost string `json:"tiupHost"`
+}
+
 // HostRow 主机列表行（含承载实例与所属集群信息）。
 type HostRow struct {
 	model.Host
@@ -49,6 +59,8 @@ type HostRow struct {
 	Roles         []string `json:"roles"`
 	ClusterNames  []string `json:"clusterNames"`
 	ClusterIDs    []int64  `json:"clusterIds"`
+	// Clusters 所属集群明细（含中控机），前端据此区分同名集群。
+	Clusters []HostClusterBrief `json:"clusters"`
 }
 
 // List 分页查询主机。
@@ -94,6 +106,22 @@ func (r *HostRepo) All(ctx context.Context) ([]HostRow, error) {
 	return r.decorate(ctx, hosts)
 }
 
+// ListByCluster 返回某集群承载实例的主机（拓扑按主机聚合用，不做额外装饰查询）。
+//
+// 只取 hosts 表里的基础信息，实例归属由调用方按 host_ip 关联：实例的 host_id
+// 在历史数据里可能为空，用 IP 兜底才不会丢主机。
+func (r *HostRepo) ListByCluster(ctx context.Context, clusterID int64) ([]model.Host, error) {
+	var hosts []model.Host
+	err := r.db.WithContext(ctx).
+		Where("id IN (SELECT host_id FROM instances WHERE cluster_id = ? AND host_id IS NOT NULL)", clusterID).
+		Order("ip ASC").
+		Find(&hosts).Error
+	if err != nil {
+		return nil, err
+	}
+	return hosts, nil
+}
+
 // decorate 为一批主机补充承载实例、角色分布与所属集群。
 func (r *HostRepo) decorate(ctx context.Context, hosts []model.Host) ([]HostRow, error) {
 	if len(hosts) == 0 {
@@ -103,14 +131,20 @@ func (r *HostRepo) decorate(ctx context.Context, hosts []model.Host) ([]HostRow,
 	for _, h := range hosts {
 		ids = append(ids, h.ID)
 	}
+	// instRow 是 Raw(...).Scan 的目标，列名一律显式声明。
+	//
+	// 注意：不要依赖 GORM 的命名推导——它会把 TiUPHost 推成 ti_up_host，与实际列
+	// tiup_host 对不上，导致 Scan 后恒为零值（集群 ID/名称恰好推导正确，所以只有
+	// 中控机字段会静默变空，界面表现为「所属集群的中控机永远是 —」）。
 	type instRow struct {
-		HostID      int64
-		Component   string
-		ClusterID   int64
-		ClusterName string
+		HostID      int64  `gorm:"column:host_id"`
+		Component   string `gorm:"column:component"`
+		ClusterID   int64  `gorm:"column:cluster_id"`
+		ClusterName string `gorm:"column:cluster_name"`
+		TiUPHost    string `gorm:"column:tiup_host"`
 	}
 	var insts []instRow
-	err := r.db.WithContext(ctx).Raw(`SELECT i.host_id, i.component, c.id AS cluster_id, c.name AS cluster_name
+	err := r.db.WithContext(ctx).Raw(`SELECT i.host_id, i.component, c.id AS cluster_id, c.name AS cluster_name, c.tiup_host
 		FROM instances i JOIN clusters c ON c.id = i.cluster_id
 		WHERE i.host_id IN ? AND c.deleted_at IS NULL`, ids).Scan(&insts).Error
 	if err != nil {
@@ -128,6 +162,18 @@ func (r *HostRepo) decorate(ctx context.Context, hosts []model.Host) ([]HostRow,
 		clusterSet[x.HostID][x.ClusterID] = x.ClusterName
 		count[x.HostID]++
 	}
+	// 集群明细（id/name/tiupHost）：同名不同中控机的集群需要靠 tiupHost 区分。
+	briefSet := map[int64]map[int64]HostClusterBrief{}
+	for _, x := range insts {
+		if briefSet[x.HostID] == nil {
+			briefSet[x.HostID] = map[int64]HostClusterBrief{}
+		}
+		briefSet[x.HostID][x.ClusterID] = HostClusterBrief{
+			ID:       x.ClusterID,
+			Name:     x.ClusterName,
+			TiUPHost: x.TiUPHost,
+		}
+	}
 	out := make([]HostRow, 0, len(hosts))
 	for _, h := range hosts {
 		row := HostRow{Host: h, InstanceCount: count[h.ID]}
@@ -141,6 +187,11 @@ func (r *HostRepo) decorate(ctx context.Context, hosts []model.Host) ([]HostRow,
 		}
 		sort.Slice(row.ClusterIDs, func(a, b int) bool { return row.ClusterIDs[a] < row.ClusterIDs[b] })
 		sort.Strings(row.ClusterNames)
+		for _, cid := range row.ClusterIDs {
+			if brief, ok := briefSet[h.ID][cid]; ok {
+				row.Clusters = append(row.Clusters, brief)
+			}
+		}
 		if row.Roles == nil {
 			row.Roles = []string{}
 		}
@@ -149,6 +200,9 @@ func (r *HostRepo) decorate(ctx context.Context, hosts []model.Host) ([]HostRow,
 		}
 		if row.ClusterIDs == nil {
 			row.ClusterIDs = []int64{}
+		}
+		if row.Clusters == nil {
+			row.Clusters = []HostClusterBrief{}
 		}
 		out = append(out, row)
 	}

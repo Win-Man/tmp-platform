@@ -67,10 +67,16 @@
           <template #default="{ row }">
             <div class="cluster-cell">
               <router-link class="cluster-name" :to="`/clusters/${row.id}`">{{ row.name }}</router-link>
+              <el-tag v-if="row.demo" size="small" type="danger" effect="dark">演示数据</el-tag>
               <el-tag v-if="row.draft" size="small" type="info" effect="plain">草稿</el-tag>
               <el-tag v-if="row.collecting" size="small" type="warning" effect="plain">采集中</el-tag>
-              <span class="text-muted mono">{{ row.tiupHost }}:{{ row.tiupPort }}</span>
             </div>
+          </template>
+        </el-table-column>
+        <!-- 中控机独立成列：不同中控机上允许存在同名集群，这一列是区分它们的唯一依据 -->
+        <el-table-column label="中控机" min-width="170">
+          <template #default="{ row }">
+            <span class="mono text-muted">{{ row.tiupHost ? `${row.tiupHost}:${row.tiupPort}` : '—' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="健康状态" width="180">
@@ -181,6 +187,7 @@
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="集群名称" prop="name">
           <el-input v-model="form.name" placeholder="字母开头，3~40 位字母/数字/下划线/短横线，如 prod-tidb" :disabled="editing" />
+          <span class="text-muted form-hint">同一中控机内集群名不可重复（不同中控机可使用相同名称）</span>
         </el-form-item>
         <el-divider content-position="left">OS 通道（TiUP 元数据）</el-divider>
         <el-row :gutter="12">
@@ -280,6 +287,16 @@
         :title="`已自动识别 PD 地址：${discoveredPd.endpoints.join('、')}`"
         :description="`${discoveredPd.message}，接管后写入集群信息，无需手动填写。`"
       />
+      <el-alert
+        v-if="demoNotice"
+        type="error"
+        :closable="true"
+        show-icon
+        class="mt-12"
+        title="演示模式：以下结果不是真实集群"
+        :description="demoNotice"
+        @close="demoNotice = ''"
+      />
       <div v-if="probeResults.length > 0">
         <el-divider content-position="left">连通性测试结果</el-divider>
         <ProbeResultList :results="probeResults" />
@@ -378,6 +395,8 @@ const testing = ref(false)
 const submitting = ref(false)
 const discovering = ref(false)
 const probeResults = ref<ProbeResult[]>([])
+// 演示模式下后端返回的提示语（明确「未连接真实集群」），在探测结果上方以红色告警展示。
+const demoNotice = ref('')
 const testToken = ref('')
 /** 表单未填 PD 地址时，服务端自动发现的结果（仅用于提示，不自动回填以免与测试凭证指纹错位）。 */
 const discoveredPd = ref<PDDiscovery | null>(null)
@@ -619,6 +638,7 @@ async function testConnection(): Promise<void> {
     probeResults.value = res.results || []
     testToken.value = res.testToken || ''
     discoveredPd.value = res.discovered || null
+    demoNotice.value = res.notice || ''
     const okCount = probeResults.value.filter((r) => r.ok).length
     if (okCount === probeResults.value.length && probeResults.value.length > 0) {
       ElMessage.success(
@@ -677,7 +697,11 @@ async function submitForm(): Promise<void> {
       testToken: testToken.value || undefined,
       force: forceSkip.value || undefined,
     })
-    ElMessage.success(res.forced ? '已按管理员强制接管，正在采集集群信息' : '接管任务已提交，正在采集集群信息')
+    if (res.demo) {
+      ElMessage.warning(res.notice || '演示模式：该集群信息来自内置样例，不代表真实集群')
+    } else {
+      ElMessage.success(res.forced ? '已按管理员强制接管，正在采集集群信息' : '接管任务已提交，正在采集集群信息')
+    }
     dialogVisible.value = false
     await load()
     if (res.jobId) {
@@ -779,5 +803,13 @@ onMounted(async () => {
 
 .ml-6 {
   margin-left: 6px;
+}
+
+/* 表单内联提示（集群名唯一性口径） */
+.form-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

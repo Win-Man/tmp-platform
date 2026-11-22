@@ -150,6 +150,8 @@ type MeResult struct {
 	User        *UserProfile `json:"user"`
 	Permissions []string     `json:"permissions"`
 	Role        string       `json:"role"`
+	// MockMode 当前是否演示模式（数据来自内置样例），前端据此展示常驻提示。
+	MockMode bool `json:"mockMode"`
 }
 
 // Me 返回当前用户信息与权限集合。

@@ -84,7 +84,9 @@ func (h *Handlers) Logout(c *gin.Context) {
 // Me GET /api/v1/auth/me
 func (h *Handlers) Me(c *gin.Context) {
 	u := currentUser(c)
-	OK(c, h.Auth.Me(u))
+	res := h.Auth.Me(u)
+	res.MockMode = h.Mode.IsMock()
+	OK(c, res)
 }
 
 // ChangePassword PUT /api/v1/auth/password

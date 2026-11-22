@@ -2,7 +2,6 @@ package collector
 
 import (
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,15 +21,39 @@ type Normalized struct {
 	HostCount        int
 }
 
+// NormalizeVersion 统一版本号展示形式（补齐 v 前缀），如 8.5.5 → v8.5.5。
+//
+// PD stores 返回的版本通常不带 v，meta.yaml 与 SELECT VERSION() 带 v，
+// 统一后避免同一集群里出现两种写法。
+func NormalizeVersion(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
+		return "v" + v[1:]
+	}
+	if v[0] >= '0' && v[0] <= '9' {
+		return "v" + v
+	}
+	return v
+}
+
 // archNormalize 架构名归一化表。
+//
+// 兼容 `tiup cluster display` 的 `linux/aarch64` 形式：含 `/` 时取最后一段。
 func NormalizeArch(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
+	arch := strings.TrimSpace(raw)
+	if i := strings.LastIndex(arch, "/"); i >= 0 {
+		arch = strings.TrimSpace(arch[i+1:])
+	}
+	switch strings.ToLower(arch) {
 	case "x86_64", "amd64", "x64", "x86-64":
 		return "x86_64"
 	case "aarch64", "arm64", "armv8", "arm64e":
 		return "aarch64"
 	default:
-		return strings.TrimSpace(raw)
+		return arch
 	}
 }
 
@@ -100,14 +123,20 @@ func normalizeServers(servers []MetaServer, component string, defaultPort, defau
 		if component == "tikv" || component == "tidb" {
 			role = "service"
 		}
+		// 状态默认 up：meta.yaml 不含状态信息，保持历史行为；
+		// 仅当 display 解析出了状态（MetaServer.Status 非空）才覆盖。
+		status := "up"
+		if s.Status != "" {
+			status = s.Status
+		}
 		out = append(out, InstanceSnapshot{
 			Component:  component,
 			HostIP:     host,
 			Port:       port,
 			StatusPort: statusPort,
 			Role:       role,
-			Status:     "up",
-			Version:    version,
+			Status:     status,
+			Version:    NormalizeVersion(version),
 			AZ:         s.AZ,
 			DeployDir:  s.DeployDir,
 			DataDir:    s.DataDir,
@@ -122,52 +151,52 @@ func NormalizeMeta(meta *TiUPMeta, clusterName string) *Normalized {
 	if meta == nil {
 		return n
 	}
-	n.Version = strings.TrimSpace(meta.ClusterVersion)
-	if n.Version == "" {
-		n.Version = strings.TrimSpace(meta.Version)
-	}
-	n.Arch = NormalizeArch(meta.Global.Arch)
+	// 版本优先级：tidb_version（真实 TiUP 写法）→ cluster_version → version。
+	n.Version = firstNonEmpty(meta.TiDBVersion, meta.ClusterVersion, meta.Version)
+	// 架构：global.arch（老版本）→ 各 server 级 arch（真实 meta 常见）→ 后续由 SSH/本地 uname 兜底。
+	n.Arch = NormalizeArch(firstNonEmpty(meta.Global.Arch, archOfServers(meta)))
 
 	version := n.Version
-	n.Instances = append(n.Instances, normalizeServers(meta.PdServers, "pd", 2379, 2379, version)...)
+	// PD 在真实 meta.yaml 里没有 port，只有 client_port / peer_port，先归一化再映射。
+	n.Instances = append(n.Instances, normalizeServers(withPDClientPort(meta.PdServers), "pd", 2379, 2379, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.TidbServers, "tidb", 4000, 10080, version)...)
+	n.Instances = append(n.Instances, normalizeServers(meta.TiproxyServers, "tiproxy", 4000, 3080, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.TikvServers, "tikv", 20160, 20180, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.TiflashServers, "tiflash", 9000, 8234, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.CdcServers, "ticdc", 8300, 8300, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.TicdcServers, "ticdc", 8300, 8300, version)...)
 
-	// 监控组件端口：Grafana 取 global.grafana_port（默认 3000），Prometheus 9090，Alertmanager 9093。
-	grafanaPort := meta.Global.GrafanaPort
-	if grafanaPort <= 0 {
-		grafanaPort = 3000
-	}
-	graphanaServers := normalizeServers(meta.GrafanaServers, "grafana", grafanaPort, grafanaPort, version)
-	n.Instances = append(n.Instances, graphanaServers...)
+	// 监控组件端口：优先取 server 级 port，其次 global.grafana_port，最后组件默认端口。
+	grafanaPort := firstPositive(meta.Global.GrafanaPort, 3000)
+	n.Instances = append(n.Instances, normalizeServers(meta.GrafanaServers, "grafana", grafanaPort, grafanaPort, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.MonitoringServers, "prometheus", 9090, 9090, version)...)
 	n.Instances = append(n.Instances, normalizeServers(meta.AlertmanagerServers, "alertmanager", 9093, 9093, version)...)
 
-	// 外部系统地址。
-	for _, s := range meta.GrafanaServers {
-		if h := pickHost(s); h != "" {
-			n.GrafanaURLs = append(n.GrafanaURLs, "http://"+h+":"+strconv.Itoa(grafanaPort))
+	// 外部系统地址（按实际端口拼装，去重后返回）。
+	// Grafana / Dashboard 优先采用 `tiup cluster display` 显式给出的地址，
+	// 未提供时才按 server 列表与端口推导（meta.yaml 路径即走推导分支）。
+	if len(meta.GrafanaURLs) > 0 {
+		n.GrafanaURLs = dedupeStrings(meta.GrafanaURLs)
+	} else {
+		n.GrafanaURLs = urlsOf(meta.GrafanaServers, grafanaPort)
+	}
+	// Prometheus：display JSON 不提供该 URL，始终按 monitoring_servers 实际端口推导。
+	n.PrometheusURLs = urlsOf(meta.MonitoringServers, 9090)
+	n.AlertmanagerURLs = urlsOf(meta.AlertmanagerServers, 9093)
+	// TiDB Dashboard 由 PD 提供：优先用 display 给出的地址，否则走 PD client port 推导。
+	if len(meta.DashboardURLs) > 0 {
+		n.DashboardURLs = dedupeStrings(meta.DashboardURLs)
+	} else {
+		for _, s := range withPDClientPort(meta.PdServers) {
+			if h := pickHost(s); h != "" {
+				n.DashboardURLs = append(n.DashboardURLs, "http://"+h+":"+strconv.Itoa(firstPositive(s.Port, 2379))+"/dashboard")
+			}
 		}
 	}
-	for _, s := range meta.MonitoringServers {
-		if h := pickHost(s); h != "" {
-			n.PrometheusURLs = append(n.PrometheusURLs, "http://"+h+":9090")
-		}
-	}
-	for _, s := range meta.AlertmanagerServers {
-		if h := pickHost(s); h != "" {
-			n.AlertmanagerURLs = append(n.AlertmanagerURLs, "http://"+h+":9093")
-		}
-	}
-	// TiDB Dashboard 由 PD 提供。
-	for _, s := range meta.PdServers {
-		if h := pickHost(s); h != "" {
-			n.DashboardURLs = append(n.DashboardURLs, "http://"+h+":2379/dashboard")
-		}
-	}
+	n.DashboardURLs = dedupeStrings(n.DashboardURLs)
+	n.GrafanaURLs = dedupeStrings(n.GrafanaURLs)
+	n.PrometheusURLs = dedupeStrings(n.PrometheusURLs)
+	n.AlertmanagerURLs = dedupeStrings(n.AlertmanagerURLs)
 
 	n.Instances = dedupeInstances(n.Instances)
 	n.ComponentCount = countComponents(n.Instances)
@@ -181,6 +210,87 @@ func pickHost(s MetaServer) string {
 		return h
 	}
 	return strings.TrimSpace(s.IP)
+}
+
+// firstNonEmpty 返回第一个非空字符串（已去首尾空白）。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// firstPositive 返回第一个正整数，全为非正数时返回 0。
+func firstPositive(vals ...int) int {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// archOfServers 从各 server 的 arch 字段推断集群架构。
+//
+// 真实 TiUP meta.yaml 的 global 段通常没有 arch，架构写在每个 server 上（如 arm64）。
+func archOfServers(m *TiUPMeta) string {
+	groups := [][]MetaServer{
+		m.PdServers, m.TidbServers, m.TiproxyServers, m.TikvServers,
+		m.TiflashServers, m.CdcServers, m.TicdcServers,
+		m.MonitoringServers, m.GrafanaServers, m.AlertmanagerServers,
+	}
+	for _, g := range groups {
+		for _, s := range g {
+			if a := strings.TrimSpace(s.Arch); a != "" {
+				return a
+			}
+		}
+	}
+	return ""
+}
+
+// withPDClientPort 返回 PD server 副本：真实 meta.yaml 里 PD 用 client_port/peer_port，没有 port。
+func withPDClientPort(in []MetaServer) []MetaServer {
+	out := make([]MetaServer, len(in))
+	copy(out, in)
+	for i := range out {
+		if out[i].Port <= 0 && out[i].ClientPort > 0 {
+			out[i].Port = out[i].ClientPort
+		}
+		if out[i].StatusPort <= 0 && out[i].PeerPort > 0 {
+			out[i].StatusPort = out[i].PeerPort
+		}
+	}
+	return out
+}
+
+// urlsOf 按 server 实际端口拼装 http 地址列表（去重）。
+func urlsOf(servers []MetaServer, defPort int) []string {
+	out := make([]string, 0, len(servers))
+	for _, s := range servers {
+		h := pickHost(s)
+		if h == "" {
+			continue
+		}
+		out = append(out, "http://"+h+":"+strconv.Itoa(firstPositive(s.Port, defPort)))
+	}
+	return dedupeStrings(out)
+}
+
+// dedupeStrings 去重并保持原有顺序。
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // dedupeInstances 按 (component, host, port) 去重（兼容 cdc_servers 与 ticdc_servers 同时存在）。
@@ -228,8 +338,8 @@ func countHosts(list []InstanceSnapshot) int {
 // componentOrder 组件展示顺序。
 func componentOrder(c string) int {
 	order := map[string]int{
-		"pd": 0, "tidb": 1, "tikv": 2, "tiflash": 3, "ticdc": 4,
-		"prometheus": 5, "grafana": 6, "alertmanager": 7,
+		"pd": 0, "tidb": 1, "tiproxy": 2, "tikv": 3, "tiflash": 4, "ticdc": 5,
+		"prometheus": 6, "grafana": 7, "alertmanager": 8,
 	}
 	if v, ok := order[c]; ok {
 		return v
@@ -237,69 +347,40 @@ func componentOrder(c string) int {
 	return 99
 }
 
-// displayRoleRe 匹配 tiup cluster display 表格中的组件列（含别名）。
-var displayRoleRe = regexp.MustCompile(`^(pd|tidb|tikv|tiflash|cdc|ticdc|grafana|prometheus|alertmanager|alert_manager|monitoring)$`)
-
-// ParseTiUPDisplay 解析 `tiup cluster display <name> -T` 的固定列宽表格输出，
-// 作为 meta.yaml 读取失败时的兜底路径。
-func ParseTiUPDisplay(output string) []InstanceSnapshot {
-	var out []InstanceSnapshot
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "ID") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, "Cluster") {
-			continue
-		}
-		fields := strings.Split(line, "\t")
-		if len(fields) < 4 {
-			continue
-		}
-		component := strings.ToLower(strings.TrimSpace(fields[1]))
-		if !displayRoleRe.MatchString(component) {
-			continue
-		}
-		if component == "cdc" {
-			component = "ticdc"
-		}
-		if component == "monitoring" {
-			component = "prometheus"
-		}
-		if component == "alert_manager" {
-			component = "alertmanager"
-		}
-		host := strings.TrimSpace(fields[2])
-		if host == "" {
-			continue
-		}
-		ports := strings.Fields(fields[3])
-		port := 0
-		if len(ports) > 0 {
-			port, _ = strconv.Atoi(ports[0])
-		}
-		status := "unknown"
-		if len(fields) > 4 {
-			status = normalizeInstanceStatus(fields[4])
-		}
-		out = append(out, InstanceSnapshot{
-			Component: component,
-			HostIP:    host,
-			Port:      port,
-			Status:    status,
-			Role:      "service",
-		})
+// metaHasServers 判断 meta 是否至少包含一条 server 定义（用于判定解析是否有效）。
+//
+// 旧实现只看 tidb_servers，会误判只有 PD/TiKV 的集群；这里检查全部组件列表。
+func metaHasServers(m *TiUPMeta) bool {
+	if m == nil {
+		return false
 	}
-	return out
+	groups := [][]MetaServer{
+		m.PdServers, m.TidbServers, m.TiproxyServers, m.TikvServers,
+		m.TiflashServers, m.CdcServers, m.TicdcServers,
+		m.GrafanaServers, m.MonitoringServers, m.AlertmanagerServers,
+	}
+	for _, g := range groups {
+		if len(g) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeInstanceStatus 把 TiUP 文本状态归一为 up/down/unhealthy/unknown。
+//
+// 判定顺序很重要：unhealthy/degraded 必须先判，否则包含子串 "healthy" 的
+// "Unhealthy" 会被误判成 up。up 只认行首或 `|up` 形态（TiUP 用 `Up|L|UI` 表达复合状态），
+// 避免 "startup" 之类的词被误判。
 func normalizeInstanceStatus(raw string) string {
 	l := strings.ToLower(strings.TrimSpace(raw))
 	switch {
-	case strings.HasPrefix(l, "up"), strings.Contains(l, "healthy"):
-		return "up"
-	case strings.HasPrefix(l, "down"), strings.Contains(l, "offline"):
-		return "down"
 	case strings.Contains(l, "unhealthy"), strings.Contains(l, "degraded"):
 		return "unhealthy"
+	case strings.HasPrefix(l, "up"), strings.Contains(l, "|up"):
+		return "up"
+	case strings.HasPrefix(l, "down"), strings.Contains(l, "down"), strings.Contains(l, "offline"):
+		return "down"
 	default:
 		return "unknown"
 	}
@@ -323,7 +404,7 @@ func MergeInstances(base []InstanceSnapshot, stores []Store) []InstanceSnapshot 
 		if s, ok := byAddr[key]; ok {
 			base[i].Status = normalizeInstanceStatus(s.StateName)
 			if s.Version != "" {
-				base[i].Version = s.Version
+				base[i].Version = NormalizeVersion(s.Version)
 			}
 			if base[i].AZ == "" {
 				if az, ok2 := s.Labels["zone"]; ok2 {
@@ -345,6 +426,9 @@ func splitHostPort(addr string) (string, string) {
 }
 
 // MergeHostResources 用 SSH 主机资源补齐 hosts（按 IP）。
+//
+// 语义：只追加 base 里没有的 IP，绝不改动 base 已有记录的任何字段。
+// 字段级补齐请用 FillHostResources。
 func MergeHostResources(hosts []HostResource, additional []HostResource) []HostResource {
 	seen := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
@@ -358,6 +442,73 @@ func MergeHostResources(hosts []HostResource, additional []HostResource) []HostR
 		hosts = append(hosts, h)
 	}
 	return hosts
+}
+
+// FillHostResources 以 base 为主、用 extra 逐字段补齐 base 中缺失的信息。
+//
+// 这是「多通道合并主机资源」的核心规则：**base 已有的值绝不被覆盖**，
+// 只填补 base 中为空（Arch/Hostname/OSUser）或为 0（各数值字段）的部分；
+// extra 中存在而 base 完全没有的 IP 会被追加。
+//
+// 采集侧按 SSH（中控机实测）→ MySQL cluster_hardware/load（其余主机）→ 仅 IP 占位
+// 的顺序逐层补齐，因此 SSH 更权威、MySQL 只负责补空白（ARCHITECTURE §6.6.5）。
+func FillHostResources(base, extra []HostResource) []HostResource {
+	out := make([]HostResource, 0, len(base)+len(extra))
+	index := make(map[string]int, len(base))
+	for _, h := range base {
+		if h.IP == "" {
+			continue
+		}
+		if _, ok := index[h.IP]; ok {
+			continue
+		}
+		index[h.IP] = len(out)
+		out = append(out, h)
+	}
+	for _, e := range extra {
+		if e.IP == "" {
+			continue
+		}
+		i, ok := index[e.IP]
+		if !ok {
+			index[e.IP] = len(out)
+			out = append(out, e)
+			continue
+		}
+		fillMissingHostFields(&out[i], e)
+	}
+	return out
+}
+
+// fillMissingHostFields 只把 dst 中缺失的字段用 src 补齐。
+func fillMissingHostFields(dst *HostResource, src HostResource) {
+	if dst.Arch == "" {
+		dst.Arch = src.Arch
+	}
+	if dst.Hostname == "" {
+		dst.Hostname = src.Hostname
+	}
+	if dst.OSUser == "" {
+		dst.OSUser = src.OSUser
+	}
+	if dst.CPUCores == 0 {
+		dst.CPUCores = src.CPUCores
+	}
+	if dst.MemoryGB == 0 {
+		dst.MemoryGB = src.MemoryGB
+	}
+	if dst.DiskTotalGB == 0 {
+		dst.DiskTotalGB = src.DiskTotalGB
+	}
+	if dst.CPUUsagePct == 0 {
+		dst.CPUUsagePct = src.CPUUsagePct
+	}
+	if dst.MemUsagePct == 0 {
+		dst.MemUsagePct = src.MemUsagePct
+	}
+	if dst.DiskUsagePct == 0 {
+		dst.DiskUsagePct = src.DiskUsagePct
+	}
 }
 
 // HostIPsFromInstances 提取实例涉及的主机 IP 列表（去重、排序）。

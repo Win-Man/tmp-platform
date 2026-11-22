@@ -56,10 +56,17 @@ func (h *Handlers) TestConnection(c *gin.Context) {
 		Fail(c, err)
 		return
 	}
+	mockMode := h.Mode.IsMock()
+	notice := ""
+	if mockMode {
+		notice = "当前为演示模式：连接测试与后续采集均返回内置样例数据，未连接真实集群。需要真实数据请以 TMP_MOCK=false 启动并关闭系统设置中的演示模式。"
+	}
 	OK(c, gin.H{
 		"results":    res.Results,
 		"testToken":  res.TestToken,
-		"mock":       h.Mode.IsMock(),
+		"mock":       mockMode,
+		"demo":       mockMode,
+		"notice":     notice,
 		"discovered": res.Discovered,
 	})
 }
@@ -99,13 +106,19 @@ func (h *Handlers) CreateCluster(c *gin.Context) {
 		"draft":    in.SaveAsDraft,
 		"force":    res.Forced,
 	})
-	Accepted(c, gin.H{
+	mockMode := h.Mode.IsMock()
+	payload := gin.H{
 		"clusterId": res.ClusterID,
 		"jobId":     res.JobID,
 		"draft":     res.Draft,
 		"forced":    res.Forced,
-		"mock":      h.Mode.IsMock(),
-	})
+		"mock":      mockMode,
+		"demo":      res.Demo,
+	}
+	if mockMode {
+		payload["notice"] = "演示模式接管：该集群信息由内置样例生成，界面会标记为「演示数据」，不代表真实集群。"
+	}
+	Accepted(c, payload)
 }
 
 // GetCluster GET /api/v1/clusters/:id
@@ -216,16 +229,17 @@ func (h *Handlers) ClusterTopology(c *gin.Context) {
 	if !ok {
 		return
 	}
-	groups, err := h.Clusters.Topology(c.Request.Context(), id)
+	topo, err := h.Clusters.Topology(c.Request.Context(), id)
 	if err != nil {
 		Fail(c, err)
 		return
 	}
-	total := 0
-	for _, g := range groups {
-		total += len(g.Nodes)
-	}
-	OK(c, gin.H{"groups": groups, "nodeCount": total})
+	OK(c, gin.H{
+		"groups":    topo.Groups,
+		"hosts":     topo.Hosts,
+		"nodeCount": topo.NodeCount,
+		"hostCount": topo.HostCount,
+	})
 }
 
 // ClusterInstances GET /api/v1/clusters/:id/instances

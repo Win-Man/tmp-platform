@@ -3,6 +3,8 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,7 +80,19 @@ func (c *CompositeCollector) Probe(ctx context.Context, t *Target, scopes []Prob
 		}(i, it.fn, it.scope)
 	}
 	wg.Wait()
-	return results, nil
+
+	// 只返回本次请求的通道结果，且保持 SSH → MySQL → PD 的固定顺序。
+	//
+	// 注意：不要返回「未执行该项探测」的占位项——调用方（如接管任务的步骤）会按下标
+	// 取第一个结果做判定，占位项会导致「明明要测 MySQL 却拿到 SSH 占位」而误判失败。
+	out := make([]ProbeResult, 0, len(items))
+	for i, it := range items {
+		if !scopeWanted(scopes, it.scope) {
+			continue
+		}
+		out = append(out, results[i])
+	}
+	return out, nil
 }
 
 // Capabilities 通过 MySQL 通道探测版本能力。
@@ -120,6 +134,7 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 	var (
 		meta      *TiUPMeta
 		hostRes   []HostResource
+		hwRes     []HostResource
 		clusterIn *ClusterInfo
 		users     []TiDBUserRow
 		vars      []VariableRow
@@ -154,6 +169,22 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 			if err == nil {
 				hostRes = h
 			}
+			return nil
+		})
+		// 其余主机的硬件信息走 MySQL（cluster_hardware / cluster_load），
+		// 与 SSH 通道并行执行，避免逐台 SSH 登录。两者互不阻塞。
+		g.Go(func() error {
+			cctx, ccancel := context.WithTimeout(ctx, ChannelTimeout)
+			defer ccancel()
+			h, err := c.mysql.FetchHostHardware(cctx, t)
+			if err != nil {
+				// 注意：这里**绝不能** setErr(KindMySQL)——硬件表只是「可选增强」，
+				// 因权限/版本不可用属于能力问题，若记成 MySQL 通道故障，
+				// Derive 会把本来健康的集群误判为 degraded/error。
+				// 降级行为：其余主机的硬件留空，由 synthesizeHosts 补仅 IP 占位。
+				return nil
+			}
+			hwRes = h
 			return nil
 		})
 	}
@@ -252,7 +283,11 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 
 	snap.Meta = meta
 	snap.Instances = instances
-	snap.Hosts = MergeHostResources(hostRes, synthesizeHosts(instances, hostRes))
+	// 主机资源逐层补齐：SSH（中控机实测，最权威）→ MySQL cluster_hardware/load（其余主机）
+	// → 仅 IP 占位（保证实例数 ≥ 主机数自洽）。每一层只补空，不覆盖已有值。
+	mergedHosts := FillHostResources(hostRes, hwRes)
+	mergedHosts = MergeHostResources(mergedHosts, synthesizeHosts(instances, mergedHosts))
+	snap.Hosts = mergedHosts
 	snap.Users = users
 	snap.Variables = vars
 	snap.Sessions = sessions
@@ -274,12 +309,96 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 		meta.ClusterVersion = normalized.Version
 		snap.DeployModeHint = NormalizeDeployMode(pdStatus.ReplicationMode)
 	}
-	// 架构兜底：SSH uname -m。
-	if normalized.Arch == "" && len(hostRes) > 0 {
-		normalized.Arch = hostRes[0].Arch
+	// 架构兜底：SSH uname -m / MySQL cpu-arch 均可提供，取首个非空值。
+	if normalized.Arch == "" {
+		for _, h := range snap.Hosts {
+			if h.Arch != "" {
+				normalized.Arch = h.Arch
+				break
+			}
+		}
 	}
 	snap.Normalized = normalized
+	if meta != nil {
+		snap.Source = meta.Source
+	}
+	snap.Consistency = crossCheckStatus(snap)
 	return snap, nil
+}
+
+// crossCheckStatus 用平台自有通道的实测结果，交叉校验 TiUP 报告的实例状态。
+//
+// `tiup cluster display` 的状态列是 TiUP 自己发起的「一次性探测」结果，
+// 会因瞬时超时把整排实例误报为 Down（曾在集群全程无重启时出现全 Down、
+// Dashboard URL 整行缺失的形态）；而 meta.yaml 兜底时根本没有状态字段、
+// 一律按 up 填写。两种情形都会让平台显示与真相不符。
+//
+// 因此这里只做一件事：发现矛盾时把话说明白，交给用户判断，
+// 绝不擅自改写 TiUP 给出的状态（那会掩盖真实故障）。
+func crossCheckStatus(s *Snapshot) []string {
+	if s == nil || s.Normalized == nil || len(s.Instances) == 0 {
+		return nil
+	}
+	var pdDown, tidbDown, tikvDown []string
+	tidbTotal, tikvTotal := 0, 0
+	for _, i := range s.Instances {
+		switch i.Component {
+		case "tidb":
+			tidbTotal++
+		case "tikv":
+			tikvTotal++
+		}
+		if i.Status == "up" {
+			continue
+		}
+		switch i.Component {
+		case "pd":
+			pdDown = append(pdDown, i.HostIP)
+		case "tidb":
+			tidbDown = append(tidbDown, i.HostIP)
+		case "tikv":
+			tikvDown = append(tikvDown, i.HostIP)
+		}
+	}
+	pdOK := s.ChanErrors[KindPD] == ""
+	mysqlOK := s.ChanErrors[KindMySQL] == ""
+
+	var out []string
+	// 1) PD 的 2379 实测可访问，但 TiUP 说 PD 不在运行。
+	if pdOK && len(pdDown) > 0 {
+		out = append(out, fmt.Sprintf(
+			"PD 服务接口实测可访问，但 TiUP 报告 pd(%s) 状态非 up —— 该状态很可能是一次失败的探测",
+			strings.Join(pdDown, ", ")))
+	}
+	// 2) MySQL 协议能连上，但 TiUP 说所有 TiDB 都不在运行。
+	if mysqlOK && tidbTotal > 0 && len(tidbDown) == tidbTotal {
+		out = append(out, fmt.Sprintf(
+			"MySQL 4000 端口实测可连接，但 TiUP 报告全部 %d 个 tidb 实例状态非 up —— 两者矛盾，请以 MySQL 连通性为准复核",
+			tidbTotal))
+	}
+	// 3) PD 里能取到 up 的 store，但 TiUP 说所有 TiKV 都不在运行。
+	if pdOK && tikvTotal > 0 && len(tikvDown) == tikvTotal && hasUpStore(s.Stores) {
+		out = append(out, fmt.Sprintf(
+			"PD 中存在 up 状态的 TiKV store，但 TiUP 报告全部 %d 个 tikv 实例状态非 up —— 两者矛盾",
+			tikvTotal))
+	}
+	// 4) 反向：拓扑一片正常，但 MySQL 根本连不上（meta.yaml 兜底时最常见）。
+	if !mysqlOK && tidbTotal > 0 && len(tidbDown) == 0 {
+		out = append(out, fmt.Sprintf(
+			"拓扑显示 %d 个 tidb 实例均正常，但 MySQL 通道连不上（%s）—— 若本次数据来自 meta.yaml，实例状态为默认值、不可作为正常依据",
+			tidbTotal, s.ChanErrors[KindMySQL]))
+	}
+	return out
+}
+
+// hasUpStore 判断 PD stores 中是否存在处于 up 状态的 TiKV。
+func hasUpStore(stores []Store) bool {
+	for _, st := range stores {
+		if strings.EqualFold(strings.TrimSpace(st.StateName), "Up") {
+			return true
+		}
+	}
+	return false
 }
 
 // instancesFromStores 用 PD stores 反推 TiKV 实例。
@@ -298,7 +417,7 @@ func instancesFromStores(stores []Store) []InstanceSnapshot {
 			StatusPort: port + 80,
 			Role:       "service",
 			Status:     normalizeInstanceStatus(s.StateName),
-			Version:    s.Version,
+			Version:    NormalizeVersion(s.Version),
 			AZ:         s.Labels["zone"],
 		})
 	}

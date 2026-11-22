@@ -2,8 +2,8 @@ package collector
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +12,13 @@ import (
 
 	"github.com/tmp-platform/backend/internal/pkg/sshcmd"
 )
+
+// cmdRunner 统一抽象 SSH 远端与本机命令执行（TiUP 与平台同机时走本地）。
+type cmdRunner interface {
+	RunTemplate(template string, args ...string) (string, error)
+	Run(cmd string) (string, error)
+	Close() error
+}
 
 // sshChannel 真实 SSH 通道：读取 TiUP meta.yaml 与主机资源。
 type sshChannel struct {
@@ -29,8 +36,11 @@ func NewSSHChannel(timeout time.Duration) SSHChannel {
 // Kind 实现 Channel。
 func (s *sshChannel) Kind() Kind { return KindSSH }
 
-// dial 建立到 TiUP 主机的 SSH 连接。
-func (s *sshChannel) dial(t *Target) (*sshcmd.Runner, error) {
+// dial 建立到 TiUP 主机的命令通道：本机地址直接本地执行，其余走 SSH。
+func (s *sshChannel) dial(t *Target) (cmdRunner, error) {
+	if sshcmd.IsLocalHost(t.TiUPHost) {
+		return sshcmd.NewLocalRunner(5 * time.Second), nil
+	}
 	return sshcmd.Dial(sshcmd.DialOptions{
 		Host:       t.TiUPHost,
 		Port:       t.TiUPPort,
@@ -45,6 +55,7 @@ func (s *sshChannel) dial(t *Target) (*sshcmd.Runner, error) {
 func (s *sshChannel) Probe(ctx context.Context, t *Target) (ProbeResult, error) {
 	start := time.Now()
 	res := ProbeResult{Scope: ScopeSSH}
+	local := sshcmd.IsLocalHost(t.TiUPHost)
 	r, err := s.dial(t)
 	if err != nil {
 		res.Message = "SSH 连接失败: " + err.Error()
@@ -61,17 +72,29 @@ func (s *sshChannel) Probe(ctx context.Context, t *Target) (ProbeResult, error) 
 	}
 	arch := NormalizeArch(strings.TrimSpace(out))
 	res.OK = true
-	res.Message = "SSH 连接成功"
-	res.Detail = map[string]any{"arch": arch, "user": t.TiUPUser}
+	if local {
+		res.Message = "本地模式：TiUP 与平台同机，已直读元数据"
+		res.Detail = map[string]any{"arch": arch, "local": true}
+	} else {
+		res.Message = "SSH 连接成功"
+		res.Detail = map[string]any{"arch": arch, "user": t.TiUPUser}
+	}
 	return res, nil
 }
 
 // metaPath 计算 meta.yaml 路径。
 //
 // 路径由「TiUP 部署目录 + 集群名」拼成，两段都经过 sshcmd 的字符白名单校验，
-// 不接受任何外部任意输入。
+// 不接受任何外部任意输入。本机模式下默认取当前用户 home（macOS 为 /Users/<user>）。
 func metaPath(t *Target) string {
 	base := strings.TrimSpace(t.TiUPDir)
+	if base == "" {
+		if sshcmd.IsLocalHost(t.TiUPHost) {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				base = home + "/.tiup"
+			}
+		}
+	}
 	if base == "" {
 		if t.TiUPUser == "root" {
 			base = "/root/.tiup"
@@ -83,7 +106,13 @@ func metaPath(t *Target) string {
 	return base + "/storage/cluster/clusters/" + t.ClusterName + "/meta.yaml"
 }
 
-// FetchTiUPMeta 读取并解析 meta.yaml；失败时回退到 `tiup cluster display -T`。
+// FetchTiUPMeta 按三级顺序采集 TiUP 集群元数据：
+//
+//  1. `tiup cluster display <name> --format=json`（首选：结构稳定、含头部信息）；
+//  2. meta.yaml（次选：display 不可用时的原始拓扑）；
+//  3. `tiup cluster display <name>` 文本输出（末选：头部 + 实例表格）。
+//
+// 三级全失败时返回聚合错误，逐级原因拼进 message 便于排错。
 func (s *sshChannel) FetchTiUPMeta(ctx context.Context, t *Target) (*TiUPMeta, error) {
 	r, err := s.dial(t)
 	if err != nil {
@@ -94,61 +123,93 @@ func (s *sshChannel) FetchTiUPMeta(ctx context.Context, t *Target) (*TiUPMeta, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path := metaPath(t)
-	content, err := r.RunTemplate("cat", path)
+
+	var reasons []string
+
+	// 第 1 级：display JSON。
+	if meta, why := fetchMetaFromDisplayJSON(r, t); meta != nil {
+		return meta, nil
+	} else if why != "" {
+		reasons = append(reasons, why)
+	}
+
+	// 第 2 级：meta.yaml。
+	if meta, why := fetchMetaFromYAML(r, t); meta != nil {
+		return meta, nil
+	} else if why != "" {
+		reasons = append(reasons, why)
+	}
+
+	// 第 3 级：display 文本输出。
+	if meta, why := fetchMetaFromDisplayText(r, t); meta != nil {
+		return meta, nil
+	} else if why != "" {
+		reasons = append(reasons, why)
+	}
+
+	return nil, fmt.Errorf("采集 TiUP 元数据失败: %s", strings.Join(reasons, "; "))
+}
+
+// fetchMetaFromDisplayJSON 第 1 级：解析 `tiup cluster display --format=json`。
+func fetchMetaFromDisplayJSON(r cmdRunner, t *Target) (*TiUPMeta, string) {
+	out, err := r.RunTemplate("tiup_display_json", t.ClusterName)
 	if err != nil {
-		// 兜底：tiup cluster display -T
-		return s.fetchMetaFromDisplay(r, t)
+		return nil, "tiup cluster display --format=json 执行失败: " + err.Error()
+	}
+	display, err := ParseDisplayJSON(out)
+	if err != nil {
+		return nil, err.Error()
+	}
+	meta := display.ToMeta()
+	if !metaHasServers(meta) {
+		return nil, "display JSON 未产出任何实例"
+	}
+	meta.Source = DisplaySourceJSON
+	return meta, ""
+}
+
+// fetchMetaFromYAML 第 2 级：读取并解析 TiUP 存储目录下的 meta.yaml。
+func fetchMetaFromYAML(r cmdRunner, t *Target) (*TiUPMeta, string) {
+	content, err := r.RunTemplate("cat", metaPath(t))
+	if err != nil {
+		return nil, "读取 meta.yaml 失败: " + err.Error()
 	}
 	var meta TiUPMeta
 	if err := yaml.Unmarshal([]byte(content), &meta); err != nil {
-		return s.fetchMetaFromDisplay(r, t)
+		return nil, "解析 meta.yaml 失败: " + err.Error()
 	}
-	if meta.ClusterVersion == "" && meta.Version == "" && len(meta.TidbServers) == 0 {
-		return s.fetchMetaFromDisplay(r, t)
+	if meta.ClusterVersion == "" && meta.Version == "" && meta.TiDBVersion == "" && !metaHasServers(&meta) {
+		return nil, "meta.yaml 内容为空（无版本信息与实例定义）"
 	}
-	return &meta, nil
+	meta.Source = MetaSourceYAML
+	return &meta, ""
 }
 
-// fetchMetaFromDisplay 用 `tiup cluster display <name> -T` 的文本表兜底构造 meta。
-func (s *sshChannel) fetchMetaFromDisplay(r *sshcmd.Runner, t *Target) (*TiUPMeta, error) {
+// fetchMetaFromDisplayText 第 3 级：解析 `tiup cluster display` 的文本输出（头部 + 实例表格）。
+func fetchMetaFromDisplayText(r cmdRunner, t *Target) (*TiUPMeta, string) {
 	out, err := r.RunTemplate("tiup_display", t.ClusterName)
 	if err != nil {
-		return nil, fmt.Errorf("读取 meta.yaml 失败且 tiup cluster display 也不可用: %w", err)
+		return nil, "tiup cluster display 文本执行失败: " + err.Error()
 	}
-	instances := ParseTiUPDisplay(out)
-	if len(instances) == 0 {
-		return nil, errors.New("无法从 tiup cluster display 解析出实例列表")
+	display, err := ParseDisplayText(out)
+	if err != nil {
+		return nil, err.Error()
 	}
-	meta := &TiUPMeta{}
-	for _, inst := range instances {
-		srv := MetaServer{Host: inst.HostIP, Port: inst.Port, StatusPort: inst.StatusPort}
-		switch inst.Component {
-		case "pd":
-			meta.PdServers = append(meta.PdServers, srv)
-		case "tidb":
-			meta.TidbServers = append(meta.TidbServers, srv)
-		case "tikv":
-			meta.TikvServers = append(meta.TikvServers, srv)
-		case "tiflash":
-			meta.TiflashServers = append(meta.TiflashServers, srv)
-		case "ticdc":
-			meta.CdcServers = append(meta.CdcServers, srv)
-		case "grafana":
-			meta.GrafanaServers = append(meta.GrafanaServers, srv)
-		case "prometheus":
-			meta.MonitoringServers = append(meta.MonitoringServers, srv)
-		case "alertmanager":
-			meta.AlertmanagerServers = append(meta.AlertmanagerServers, srv)
-		}
+	meta := display.ToMeta()
+	if !metaHasServers(meta) {
+		return nil, "display 文本未产出任何实例"
 	}
-	return meta, nil
+	meta.Source = DisplaySourceText
+	return meta, ""
 }
 
 // FetchHostResource 采集 TiUP 主机自身资源（CPU/内存/磁盘/使用率）。
 //
-// 说明：MVP 只采集 TiUP 主机；其余主机的 CPU 核数与内存来自
-// information_schema.cluster_hardware（MySQL 通道），无需逐台 SSH 登录。
+// 说明：SSH 只采中控机这一台（其余主机没有凭据、也不该逐台登录）。
+// 其余主机的硬件信息由 MySQL 通道的 FetchHostHardware 补齐 ——
+// 走 information_schema.cluster_hardware（架构 / 核数 / 内存容量 / 磁盘容量与用量）
+// 与 information_schema.cluster_load（CPU idle、内存 used-percent），
+// 聚合逻辑见 hardware.go:AggregateHostHardware。
 func (s *sshChannel) FetchHostResource(ctx context.Context, t *Target) ([]HostResource, error) {
 	r, err := s.dial(t)
 	if err != nil {
@@ -181,7 +242,7 @@ func (s *sshChannel) FetchHostResource(ctx context.Context, t *Target) ([]HostRe
 }
 
 // cpuUsage 通过两次读取 /proc/stat 计算瞬时 CPU 使用率。
-func (s *sshChannel) cpuUsage(r *sshcmd.Runner) float64 {
+func (s *sshChannel) cpuUsage(r cmdRunner) float64 {
 	first, err := r.RunTemplate("cat", "/proc/stat")
 	if err != nil {
 		return 0

@@ -68,7 +68,6 @@
             <el-icon><Fold /></el-icon>
           </el-button>
           <span class="topbar-title">{{ route.meta.title || '' }}</span>
-          <el-tag v-if="mockMode" type="warning" effect="plain" size="small">演示模式</el-tag>
         </div>
         <div class="topbar-right">
           <el-tooltip content="进行中任务" placement="bottom">
@@ -98,6 +97,17 @@
         </div>
       </el-header>
 
+      <!-- 演示模式常驻横幅：样例数据与真实集群数据必须一眼可辨（避免把内置数据当成线上信息） -->
+      <el-alert
+        v-if="mockMode"
+        class="demo-banner"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="演示模式：当前展示的是内置样例数据，未连接任何真实集群"
+        :description="mockDescription"
+      />
+
       <el-main class="main">
         <router-view v-slot="{ Component }">
           <component :is="Component" :key="route.fullPath" />
@@ -126,6 +136,7 @@ const app = useAppStore()
 
 const passwordVisible = ref(false)
 const mockMode = ref(false)
+const mockForced = ref(false)
 let mockTimer: number | null = null
 
 /** 后端 40302（需先改初始密码）时重新强制弹出改密弹窗。 */
@@ -148,6 +159,12 @@ const activeMenu = computed(() => {
 
 const initial = computed(() => (auth.displayName || 'U').slice(0, 1).toUpperCase())
 
+const mockDescription = computed(() =>
+  mockForced.value
+    ? 'TMP_MOCK=true 已强制启用演示模式：接管、采集、巡检与报告结果均为模拟数据。要接真实集群，请去掉该环境变量后重启。'
+    : '可在「系统设置 → 演示模式」关闭；关闭后接管真实集群才会走 SSH / MySQL / PD 真实采集。',
+)
+
 const roleLabels: Record<string, string> = { admin: '管理员', operator: 'DBA', viewer: '只读' }
 const roleLabel = computed(() => roleLabels[auth.user?.role || ''] || auth.user?.role || '')
 
@@ -156,6 +173,7 @@ async function refreshMockMode(): Promise<void> {
   try {
     const res = await settingApi.demoMode()
     mockMode.value = res.enabled
+    mockForced.value = Boolean(res.forced)
   } catch {
     mockMode.value = false
   }
@@ -211,6 +229,14 @@ async function onCommand(command: string): Promise<void> {
 <style scoped lang="scss">
 .layout {
   height: 100vh;
+}
+
+// 演示模式横幅：贴住顶部、不参与滚动，确保任何页面都能看到「数据是样例」。
+.demo-banner {
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  flex-shrink: 0;
 }
 
 .sidebar {

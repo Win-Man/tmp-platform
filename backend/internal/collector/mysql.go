@@ -236,7 +236,12 @@ func (c *mysqlChannel) FetchVariables(ctx context.Context, t *Target) ([]Variabl
 	return out, nil
 }
 
-// FetchSessions 读取 processlist。
+// FetchSessions 读取集群级 processlist。
+//
+// 首选 information_schema.cluster_processlist：一次查询覆盖所有 TiDB 实例，
+// 并带 INSTANCE 列（形如 10.10.10.10:4000），这是「会话」页面的权威来源。
+// 该表需要 PROCESS 权限、且由 TiDB 4.0+ 提供；失败时退回只覆盖当前实例的
+// information_schema.processlist，用连接地址兜底 INSTANCE。
 func (c *mysqlChannel) FetchSessions(ctx context.Context, t *Target) ([]SessionRow, error) {
 	db, err := c.open(ctx, t)
 	if err != nil {
@@ -244,17 +249,22 @@ func (c *mysqlChannel) FetchSessions(ctx context.Context, t *Target) ([]SessionR
 	}
 	defer func() { _ = db.Close() }()
 
-	rows, err := c.queryMaps(ctx, db,
-		"SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.processlist")
+	rows, clusterWide, err := c.sessionRows(ctx, db)
 	if err != nil {
 		return nil, err
 	}
+	fallbackInstance := net.JoinHostPort(t.DBHost, strconv.Itoa(effectivePort(t)))
 	out := make([]SessionRow, 0, len(rows))
 	for _, r := range rows {
 		id, _ := strconv.ParseInt(getStr(r, "id"), 10, 64)
 		tsec, _ := strconv.Atoi(getStr(r, "time"))
+		instance := getStr(r, "instance")
+		if instance == "" && !clusterWide {
+			instance = fallbackInstance
+		}
 		out = append(out, SessionRow{
 			ID:        id,
+			Instance:  instance,
 			UserName:  getStr(r, "user"),
 			Host:      getStr(r, "host"),
 			DB:        getStr(r, "db"),
@@ -265,6 +275,29 @@ func (c *mysqlChannel) FetchSessions(ctx context.Context, t *Target) ([]SessionR
 		})
 	}
 	return out, nil
+}
+
+// sessionRows 依次尝试 cluster_processlist → processlist。
+func (c *mysqlChannel) sessionRows(ctx context.Context, db *sql.DB) ([]map[string]string, bool, error) {
+	rows, err := c.queryMaps(ctx, db,
+		"SELECT INSTANCE, ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.cluster_processlist")
+	if err == nil {
+		return rows, true, nil
+	}
+	fallback, ferr := c.queryMaps(ctx, db,
+		"SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.processlist")
+	if ferr != nil {
+		return nil, false, ferr
+	}
+	return fallback, false, nil
+}
+
+// effectivePort 返回实际连接的端口（默认 4000）。
+func effectivePort(t *Target) int {
+	if t.DBPort > 0 {
+		return t.DBPort
+	}
+	return 4000
 }
 
 // FetchResourceGroups 读取 Resource Group；低版本返回 ErrUnsupported。
@@ -333,6 +366,46 @@ func (c *mysqlChannel) QueryMaps(ctx context.Context, t *Target, query string, a
 	}
 	defer func() { _ = db.Close() }()
 	return c.queryMaps(ctx, db, query, args...)
+}
+
+// FetchHostHardware 采集集群内所有主机的硬件规格与负载。
+//
+// 数据来源（列结构同构，均为 TYPE/INSTANCE/DEVICE_TYPE/DEVICE_NAME/NAME/VALUE）：
+//   - information_schema.cluster_hardware：cpu-arch / cpu-logical-cores / cpu-physical-cores、
+//     内存 capacity、磁盘 path/total/used/used-percent；
+//   - information_schema.cluster_load：cpu/usage/idle、memory/virtual/used-percent。
+//
+// 语义约定（ARCHITECTURE §6.6.4）：
+//   - cluster_hardware 失败直接返回 error（编排层吞掉并降级，不影响整次采集）；
+//   - cluster_load 失败只跳过（使用率保持 0），因为硬件规格仍然可用；
+//   - 行 → []HostResource 的聚合逻辑在 hardware.go:AggregateHostHardware（纯函数，可单测）。
+func (c *mysqlChannel) FetchHostHardware(ctx context.Context, t *Target) ([]HostResource, error) {
+	db, err := c.open(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = db.Close() }()
+
+	hw, err := c.queryMaps(ctx, db,
+		"SELECT INSTANCE, DEVICE_TYPE, DEVICE_NAME, NAME, VALUE FROM information_schema.cluster_hardware")
+	if err != nil {
+		return nil, fmt.Errorf("读取主机硬件信息失败: %s", sanitizeDBErr(err))
+	}
+	// 负载表需要单独的权限/版本支持，失败只降级不报错。
+	//
+	// 带上 TYPE 列：一台机器上往往同时有 tidb/tikv/pd 多个实例，聚合时需要优先取
+	// tidb 实例的负载（hardware.go: pickLoadSamples）。若个别版本没有该列，
+	// 退化为不带 TYPE 的查询——此时聚合按「INSTANCE 最小」的确定性规则取数。
+	load, loadErr := c.queryMaps(ctx, db,
+		"SELECT TYPE, INSTANCE, DEVICE_TYPE, DEVICE_NAME, NAME, VALUE FROM information_schema.cluster_load")
+	if loadErr != nil {
+		load, loadErr = c.queryMaps(ctx, db,
+			"SELECT INSTANCE, DEVICE_TYPE, DEVICE_NAME, NAME, VALUE FROM information_schema.cluster_load")
+	}
+	if loadErr != nil {
+		load = nil
+	}
+	return AggregateHostHardware(hw, load), nil
 }
 
 // queryMaps 把任意结果集扫描为 map[string]string（键统一小写）。

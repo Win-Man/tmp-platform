@@ -107,6 +107,19 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 	}
 }
 
+// NoCacheMiddleware 禁止浏览器缓存接口响应。
+//
+// 集群状态、采集快照这类数据随时可能变化，一旦被缓存（含代理复用），
+// 用户会看到「点了刷新还是旧数据」，必须整页 F5 才能更新。
+func NoCacheMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
+		c.Next()
+	}
+}
+
 // RequestID 从上下文取请求 ID。
 func RequestID(c *gin.Context) string {
 	if v, ok := c.Get(auth.CtxRequestIDKey); ok {
