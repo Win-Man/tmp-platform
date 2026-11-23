@@ -58,6 +58,14 @@ type Target struct {
 
 	PDHost string
 	PDPort int
+
+	// SSHCredIssue / DBCredIssue 记录「密文存在但解不开」的原因（主密钥换过）。
+	//
+	// 解密失败时不能静默当成「没配密码」：那样报错会退化成
+	// 「缺少凭据（密码或私钥）」「Access denied (using password: NO)」，
+	// 把真正的原因（secret.key 变更）盖掉。非空时各通道在连接前直接报出来。
+	SSHCredIssue string
+	DBCredIssue  string
 }
 
 // ProbeResult 单项连通性探测结果。

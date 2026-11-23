@@ -40,6 +40,10 @@ func (c *mysqlChannel) open(ctx context.Context, t *Target) (*sql.DB, error) {
 	if t.DBHost == "" {
 		return nil, errors.New("未配置数据库地址")
 	}
+	// 解密失败时直接报原因，否则只会拿到 1045 (using password: NO) 这种误导性错误。
+	if strings.TrimSpace(t.DBPassword) == "" && t.DBCredIssue != "" {
+		return nil, errors.New(t.DBCredIssue)
+	}
 	port := t.DBPort
 	if port <= 0 {
 		port = 4000

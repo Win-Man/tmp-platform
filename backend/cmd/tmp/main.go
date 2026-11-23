@@ -111,6 +111,14 @@ func run() error {
 	inspectRepo := repo.NewInspectRepo(gdb)
 	addrMapRepo := repo.NewAddrMapRepo(gdb)
 
+	// 新生成的密钥意味着旧密文全部作废：启动时直接挑明，别等到采集全红再猜原因。
+	if generated {
+		if creds, cerr := credRepo.ListWithCluster(bootCtx); cerr == nil && len(creds) > 0 {
+			log.Error("主密钥为本次新生成，库中已有凭据无法解密，需在集群配置中重新填写 SSH / 数据库密码",
+				"affectedClusters", len(creds))
+		}
+	}
+
 	jwtMgr := auth.NewManager(jwtSecret, jwtTTL(bootCtx, settingRepo, log))
 
 	// ---------- 领域服务 ----------

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -47,6 +48,10 @@ func (s *sshChannel) dial(t *Target) (cmdRunner, error) {
 	// 组装目标为空时给出明确提示，避免 sshcmd 只报「缺少主机或用户名」。
 	if strings.TrimSpace(t.TiUPHost) == "" || strings.TrimSpace(t.TiUPUser) == "" {
 		return nil, fmt.Errorf("SSH 登录信息不完整（TiUP 地址=%q，SSH 用户=%q）", t.TiUPHost, t.TiUPUser)
+	}
+	// 解密失败导致的「空密码」优先报原因，不要落到 sshcmd 的通用提示上。
+	if strings.TrimSpace(t.TiUPPassword) == "" && strings.TrimSpace(t.TiUPKey) == "" && t.SSHCredIssue != "" {
+		return nil, errors.New(t.SSHCredIssue)
 	}
 	return sshcmd.Dial(sshcmd.DialOptions{
 		Host:           t.TiUPHost,
