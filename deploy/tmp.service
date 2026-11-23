@@ -1,0 +1,35 @@
+[Unit]
+Description=TMP · TiDB 管理平台
+Documentation=https://github.com/Win-Man/tmp-platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__TMP_USER__
+Group=__TMP_USER__
+WorkingDirectory=__TMP_PREFIX__
+# 环境变量文件（KEY=VALUE，不要把 export 写进去）
+EnvironmentFile=-__TMP_PREFIX__/tmp.env
+ExecStart=__TMP_PREFIX__/bin/tmp
+Restart=on-failure
+RestartSec=5s
+# 优雅退出：main.go 收到 SIGTERM 后最多等 15s 收尾
+KillSignal=SIGTERM
+TimeoutStopSec=25s
+
+# 资源与句柄
+LimitNOFILE=65535
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# 只读保护家目录：接管「同机 TiUP 集群」时需要读 ~/.tiup 元数据，
+# 这里用 read-only 而非 tmpfs，保证可读、不可改。
+ProtectHome=read-only
+# 唯一可写目录
+ReadWritePaths=__TMP_PREFIX__/data
+
+[Install]
+WantedBy=multi-user.target

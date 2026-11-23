@@ -31,10 +31,13 @@ func Load() *Config {
 	if err != nil {
 		cwd = "."
 	}
+	dataDir := env("TMP_DATA_DIR", filepath.Join(cwd, "data"))
 	cfg := &Config{
-		Addr:     env("TMP_ADDR", ":8080"),
-		DataDir:  env("TMP_DATA_DIR", filepath.Join(cwd, "data")),
-		DBPath:   env("TMP_DB", filepath.Join(cwd, "tmp.db")),
+		Addr:    env("TMP_ADDR", ":8080"),
+		DataDir: dataDir,
+		// DBPath 默认跟随数据目录：只设 TMP_DATA_DIR 时，数据库也落在该目录，
+		// 避免误落到进程工作目录（容器场景尤其容易踩）。
+		DBPath:   env("TMP_DB", filepath.Join(dataDir, "tmp.db")),
 		Secret:   os.Getenv("TMP_SECRET"),
 		Mock:     envBool("TMP_MOCK", false),
 		GinMode:  env("TMP_GIN_MODE", "release"),

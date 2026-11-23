@@ -3,6 +3,9 @@
 /backend/web/dist/
 /backend/bin/
 
+# 离线部署包产物
+/dist/
+
 # 前端
 /frontend/node_modules/
 /frontend/dist/
