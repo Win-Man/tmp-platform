@@ -5,7 +5,7 @@ package config
 //	go build -ldflags "-X github.com/tmp-platform/backend/internal/config.Version=1.0.0 ..."
 var (
 	// Version 平台版本号。
-	Version = "1.0.1-mvp"
+	Version = "1.0.2-mvp"
 	// BuildTime 构建时间（RFC3339）。
 	BuildTime = "unknown"
 	// Commit 构建对应的 git commit。

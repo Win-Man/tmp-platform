@@ -1,6 +1,6 @@
 # TMP · TiDB 管理平台 —— X86 离线部署手册
 
-适用版本：`1.0.1-mvp` ｜ 目标平台：**Linux x86_64（amd64）** ｜ 部署方式：**单机单二进制 + 内置 SQLite**
+适用版本：`1.0.2-mvp` ｜ 目标平台：**Linux x86_64（amd64）** ｜ 部署方式：**单机单二进制 + 内置 SQLite**
 
 ---
 
@@ -23,7 +23,7 @@
 ## 2. 包内容
 
 ```
-tmp-1.0.1-mvp-linux-amd64/
+tmp-1.0.2-mvp-linux-amd64/
 ├── bin/tmp               # 静态二进制（API + 内嵌前端）
 ├── install.sh            # 一键安装 / 原地升级（systemd 托管）
 ├── uninstall.sh          # 卸载（默认保留数据）
@@ -64,8 +64,8 @@ sha256sum -c SHA256SUMS
 
 ```bash
 # 1) 上传并解压
-tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz
-cd tmp-1.0.1-mvp-linux-amd64
+tar -xzf tmp-1.0.2-mvp-linux-amd64.tar.gz
+cd tmp-1.0.2-mvp-linux-amd64
 
 # 2) 校验 + 环境自检
 sha256sum -c SHA256SUMS
@@ -96,8 +96,8 @@ sudo ./install.sh --no-systemd             # 只铺文件，不注册服务
 `start.sh` 是 POSIX sh，**Alpine 等无 bash 的精简系统也能直接运行**：
 
 ```bash
-tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz
-cd tmp-1.0.1-mvp-linux-amd64
+tar -xzf tmp-1.0.2-mvp-linux-amd64.tar.gz
+cd tmp-1.0.2-mvp-linux-amd64
 
 # 前台运行（数据落在 ./data，数据库自动落在 ./data/tmp.db）
 sh ./start.sh
@@ -118,7 +118,7 @@ curl -s http://127.0.0.1:8080/readyz
 ```dockerfile
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates tzdata
-COPY tmp-1.0.1-mvp-linux-amd64/bin/tmp /usr/local/bin/tmp
+COPY tmp-1.0.2-mvp-linux-amd64/bin/tmp /usr/local/bin/tmp
 ENV TMP_ADDR=:8080 TMP_DATA_DIR=/data
 VOLUME /data
 EXPOSE 8080
@@ -197,7 +197,7 @@ journalctl -u tmp --since "1 hour ago"
 把新包解压后**直接再执行一次 `install.sh`**（参数与原安装保持一致即可）：
 
 ```bash
-tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz && cd tmp-1.0.1-mvp-linux-amd64
+tar -xzf tmp-1.0.2-mvp-linux-amd64.tar.gz && cd tmp-1.0.2-mvp-linux-amd64
 sha256sum -c SHA256SUMS
 sudo ./install.sh --port 8080 --user tiup      # 参数与上次安装一致
 ```

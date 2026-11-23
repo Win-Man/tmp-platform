@@ -14,7 +14,7 @@ SHELL := /bin/bash
 
 # ---- 元信息 ----
 APP        := tmp
-VERSION    ?= 1.0.1-mvp
+VERSION    ?= 1.0.2-mvp
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 ROOT       := $(shell pwd)

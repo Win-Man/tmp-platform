@@ -195,7 +195,10 @@ else
   c_yellow "⚠ 服务未在 30s 内通过 /readyz 检查，请查看日志排错"
 fi
 
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# 取本机 IP 仅用于拼访问地址。busybox / 精简系统上 `hostname -I` 可能不存在，
+# 这里必须兜住：否则 set -e 会在打印成功信息之后中断脚本，退出码非零，
+# 还会跳过末尾的 secret.key 备份提醒。
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "${IP:-}" ] || IP="<本机IP>"
 cat <<EOF
 

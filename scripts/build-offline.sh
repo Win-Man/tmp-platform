@@ -2,7 +2,7 @@
 #
 # 构建离线部署包（在联网/有工具链的构建机上执行）
 #
-#   ./scripts/build-offline.sh                 # 默认 1.0.1-mvp / linux-amd64
+#   ./scripts/build-offline.sh                 # 默认 1.0.2-mvp / linux-amd64
 #   VERSION=1.0.2 ./scripts/build-offline.sh   # 指定版本号
 #   GOARCH=arm64 ./scripts/build-offline.sh    # 交叉编译到 ARM64
 #
@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 APP="tmp"
-VERSION="${VERSION:-1.0.1-mvp}"
+VERSION="${VERSION:-1.0.2-mvp}"
 GOOS="${GOOS:-linux}"
 GOARCH="${GOARCH:-amd64}"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
