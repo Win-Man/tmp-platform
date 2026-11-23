@@ -912,17 +912,69 @@ func (s *ClusterService) saveCredentials(ctx context.Context, clusterID int64, s
 	return nil
 }
 
+// mergeCredentials 覆盖本次提交的非空凭据，未提交的沿用库里原密文。
+//
+// 与 saveCredentials 的分工：那个用于新接管（三列一次给齐）；这个用于编辑补救，
+// 用户可能只想改 SSH 密码，此时绝不能因为数据库密码留空就把原密文清掉。
+func (s *ClusterService) mergeCredentials(ctx context.Context, clusterID int64, sshPwd, sshKey, dbPwd string, by *int64) error {
+	if sshPwd == "" && sshKey == "" && dbPwd == "" {
+		return nil
+	}
+	cred := &model.ClusterCredential{ClusterID: clusterID, KeyVersion: 1, UpdatedBy: by}
+	existing, err := s.creds.GetByClusterID(ctx, clusterID)
+	switch {
+	case err == nil:
+		cred.SSHPasswordEnc = existing.SSHPasswordEnc
+		cred.SSHKeyEnc = existing.SSHKeyEnc
+		cred.DBPasswordEnc = existing.DBPasswordEnc
+		cred.KeyVersion = existing.KeyVersion
+	case errors.Is(err, repo.ErrNotFound):
+		// 首次补录凭据，其余列留空即可。
+	default:
+		return apperr.Internal("读取凭据失败")
+	}
+	targets := []struct {
+		plain string
+		dst   *string
+		label string
+	}{
+		{sshPwd, &cred.SSHPasswordEnc, "OS 凭据加密失败"},
+		{sshKey, &cred.SSHKeyEnc, "SSH 私钥加密失败"},
+		{dbPwd, &cred.DBPasswordEnc, "数据库凭据加密失败"},
+	}
+	for _, t := range targets {
+		if t.plain == "" {
+			continue
+		}
+		enc, eerr := s.cipher.Encrypt(t.plain)
+		if eerr != nil {
+			return apperr.Internal(t.label)
+		}
+		*t.dst = enc
+	}
+	if uerr := s.creds.Upsert(ctx, cred); uerr != nil {
+		return apperr.Internal("保存凭据失败")
+	}
+	return nil
+}
+
 // UpdateInput 编辑纳管信息入参。
+//
+// 凭据三列（SSH 密码 / 私钥 / 数据库密码）也在编辑范围内：主密钥轮换、
+// 改密码之后用户就是从这里补救。留空表示「不修改」，非空才覆盖。
 type UpdateInput struct {
-	Name       string `json:"name"`
-	TiUPHost   string `json:"tiupHost"`
-	TiUPPort   int    `json:"tiupPort"`
-	TiUPUser   string `json:"tiupUser"`
-	TiUPDir    string `json:"tiupDir"`
-	DBHost     string `json:"dbHost"`
-	DBPort     int    `json:"dbPort"`
-	DBUser     string `json:"dbUser"`
-	PDEndpoint string `json:"pdEndpoint"`
+	Name        string `json:"name"`
+	TiUPHost    string `json:"tiupHost"`
+	TiUPPort    int    `json:"tiupPort"`
+	TiUPUser    string `json:"tiupUser"`
+	TiUPDir     string `json:"tiupDir"`
+	SSHPassword string `json:"sshPassword"`
+	SSHKey      string `json:"sshKey"`
+	DBHost      string `json:"dbHost"`
+	DBPort      int    `json:"dbPort"`
+	DBUser      string `json:"dbUser"`
+	DBPassword  string `json:"dbPassword"`
+	PDEndpoint  string `json:"pdEndpoint"`
 }
 
 // Update 编辑纳管信息；改后置 collect_status=degraded 提示需重采。
@@ -1017,6 +1069,11 @@ func (s *ClusterService) Update(ctx context.Context, id int64, in UpdateInput) (
 	}
 	if err := s.clusters.UpdateFields(ctx, id, fields); err != nil {
 		return nil, apperr.Internal("更新集群失败")
+	}
+	// 凭据在同一事务语义里补写：界面「编辑」里填的密码必须真的落库，
+	// 否则用户以为改了、实际密文还是旧的（主密钥轮换后就卡在这里）。
+	if err := s.mergeCredentials(ctx, id, in.SSHPassword, in.SSHKey, in.DBPassword, nil); err != nil {
+		return nil, err
 	}
 	updated, err := s.clusters.GetByID(ctx, id)
 	if err != nil {

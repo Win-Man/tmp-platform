@@ -152,6 +152,9 @@ func (h *Handlers) UpdateCluster(c *gin.Context) {
 	}
 	h.RecordAudit(c, service.AuditClusterUpdate, "cluster", itoa(id), d.Name, "success", map[string]any{
 		"tiupHost": in.TiUPHost, "dbHost": in.DBHost,
+		"sshPasswordUpdated": in.SSHPassword != "",
+		"sshKeyUpdated":      in.SSHKey != "",
+		"dbPasswordUpdated":  in.DBPassword != "",
 	})
 	OK(c, d)
 }
