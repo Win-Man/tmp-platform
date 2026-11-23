@@ -53,7 +53,7 @@
           <div class="cap-item">
             <span>Resource Group</span>
             <el-tag :type="caps?.supportsResourceGroup ? 'success' : 'info'" effect="plain" size="small">
-              {{ caps?.supportsResourceGroup ? '支持（v7.5+）' : '不支持' }}
+              {{ caps?.supportsResourceGroup ? '支持' : '不支持' }}
             </el-tag>
           </div>
           <div class="cap-item">

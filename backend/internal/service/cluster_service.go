@@ -312,7 +312,8 @@ func (s *ClusterService) toDetail(ctx context.Context, c *model.Cluster) (*Clust
 	if c.Capabilities != "" {
 		var caps collector.Capabilities
 		if err := json.Unmarshal([]byte(c.Capabilities), &caps); err == nil {
-			d.Capabilities = &caps
+			// 支持矩阵可能已更新（如新增 v7.1.8-5.x 回移分支），按当前规则校正快照。
+			d.Capabilities = collector.NormalizeCapabilities(&caps, c.TiDBVersion)
 		}
 	}
 	return d, nil
@@ -1607,7 +1608,8 @@ func (s *ClusterService) Capabilities(ctx context.Context, id int64) (*Capabilit
 	if c.Capabilities != "" {
 		var parsed collector.Capabilities
 		if err := json.Unmarshal([]byte(c.Capabilities), &parsed); err == nil {
-			caps = &parsed
+			// 支持矩阵可能已更新（如新增 v7.1.8-5.x 回移分支），按当前规则校正快照。
+			caps = collector.NormalizeCapabilities(&parsed, c.TiDBVersion)
 		}
 	}
 	if caps == nil {
