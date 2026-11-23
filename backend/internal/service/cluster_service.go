@@ -16,6 +16,7 @@ import (
 	"github.com/tmp-platform/backend/internal/crypto"
 	"github.com/tmp-platform/backend/internal/job"
 	"github.com/tmp-platform/backend/internal/model"
+	"github.com/tmp-platform/backend/internal/pkg/addrmap"
 	"github.com/tmp-platform/backend/internal/pkg/apperr"
 	"github.com/tmp-platform/backend/internal/repo"
 )
@@ -37,6 +38,9 @@ type ClusterService struct {
 	engine      *job.Engine
 	topoRepo    *repo.TiDBObjRepo
 	probeTokens *ProbeTokenSigner
+	// addrMaps 地址映射规则仓储：多网络平面下把内网地址改写为 TMP 可达地址。
+	// 允许为 nil（单测/未接入场景），此时所有地址原样输出。
+	addrMaps *repo.AddrMapRepo
 }
 
 // ClusterDeps 集群服务依赖集合。
@@ -51,6 +55,7 @@ type ClusterDeps struct {
 	Mode      *ModeManager
 	Cipher    *crypto.Cipher
 	TiDBObj   *repo.TiDBObjRepo
+	AddrMaps  *repo.AddrMapRepo
 	// ProbeTokens 连接测试凭证签发器；为 nil 时使用进程内随机密钥（仅测试场景）。
 	ProbeTokens *ProbeTokenSigner
 }
@@ -73,7 +78,23 @@ func NewClusterService(d ClusterDeps) *ClusterService {
 		cipher:      d.Cipher,
 		topoRepo:    d.TiDBObj,
 		probeTokens: signer,
+		addrMaps:    d.AddrMaps,
 	}
+}
+
+// addrMapper 构建集群的地址映射器。
+//
+// 返回 nil 表示「不做改写」：未配置规则、仓储未注入或查询失败都走这条路径。
+// 映射只影响 TMP 视角的访问，读失败不应该让集群详情整体报错。
+func (s *ClusterService) addrMapper(ctx context.Context, clusterID int64) *addrmap.Mapper {
+	if s == nil || s.addrMaps == nil {
+		return nil
+	}
+	list, err := s.addrMaps.ListEnabled(ctx, clusterID)
+	if err != nil {
+		return nil
+	}
+	return BuildAddrMapper(list)
 }
 
 // SetEngine 注入任务引擎（解决构造期循环依赖）。
@@ -143,6 +164,9 @@ type ClusterDetail struct {
 	AlertmanagerURLs []string                `json:"alertmanagerUrls"`
 	Credentials      CredentialMask          `json:"credentials"`
 	Capabilities     *collector.Capabilities `json:"capabilities"`
+	// AddrMapped 表示该集群配置了启用的地址映射规则，
+	// 上面这些地址已按规则改写为 TMP 可达地址（原始值仍保存在采集快照里）。
+	AddrMapped bool `json:"addrMapped"`
 }
 
 // ToBrief 转换为列表行。
@@ -287,19 +311,51 @@ func (s *ClusterService) Get(ctx context.Context, id int64) (*ClusterDetail, err
 }
 
 // toDetail 组装详情（凭据一律掩码）。
+//
+// 地址类字段（PD / Dashboard / Grafana / Prometheus / Alertmanager）在这里做映射改写：
+// 采集落库的值恒为集群内网平面的原始地址，映射只作用于「TMP 视角的读」。
+// DBHost 与 TiUPHost 是用户录入的、本就要求可达的地址，不做改写 —— 否则会出现
+// 「页面显示 A、实际连 B」的口径分裂。
 func (s *ClusterService) toDetail(ctx context.Context, c *model.Cluster) (*ClusterDetail, error) {
+	mp := s.addrMapper(ctx, c.ID)
+	// mapped 只在「确实改写了某个地址」时为真：配了规则但一条都没命中时，
+	// 页面不该显示「已映射」——那会让用户误以为生效了。
+	mapped := false
+	mapOne := func(v string) string {
+		if strings.TrimSpace(v) == "" {
+			return v
+		}
+		out := mp.MapString(v)
+		if out != v {
+			mapped = true
+		}
+		return out
+	}
+	mapList := func(list []string) []string {
+		if len(list) == 0 {
+			return list
+		}
+		out := make([]string, len(list))
+		for i, v := range list {
+			out[i] = mapOne(v)
+		}
+		return out
+	}
+
 	d := &ClusterDetail{
 		ClusterBrief:     ToBrief(c),
 		TiUPDir:          c.TiUPDir,
 		DBHost:           c.DBHost,
 		DBPort:           c.DBPort,
 		DBUser:           c.DBUser,
-		PDEndpoint:       c.PDEndpoint,
-		DashboardURLs:    parseURLList(c.DashboardURLs),
-		PrometheusURLs:   parseURLList(c.PrometheusURLs),
-		GrafanaURLs:      parseURLList(c.GrafanaURLs),
-		AlertmanagerURLs: parseURLList(c.AlertmanagerURLs),
+		PDEndpoint:       mapOne(c.PDEndpoint),
+		DashboardURLs:    mapList(parseURLList(c.DashboardURLs)),
+		PrometheusURLs:   mapList(parseURLList(c.PrometheusURLs)),
+		GrafanaURLs:      mapList(parseURLList(c.GrafanaURLs)),
+		AlertmanagerURLs: mapList(parseURLList(c.AlertmanagerURLs)),
 	}
+	// 必须放在字面量之后：AddrMapped 依赖上面几次 mapXxx 调用累积出的结果。
+	d.AddrMapped = mapped
 	if cred, err := s.creds.GetByClusterID(ctx, c.ID); err == nil && cred != nil {
 		updated := cred.UpdatedAt
 		d.Credentials = CredentialMask{
@@ -1381,6 +1437,9 @@ type TopologyNode struct {
 	Role       string `json:"role"`
 	Version    string `json:"version"`
 	AZ         string `json:"az"`
+	// RawHostIP 采集到的原始地址；仅在地址映射生效且改写成功时填写，
+	// 便于界面标注「这是内网地址，实际访问用 hostIp」。
+	RawHostIP string `json:"rawHostIp,omitempty"`
 }
 
 // TopologyGroup 按组件分组的拓扑。
@@ -1392,6 +1451,7 @@ type TopologyGroup struct {
 // TopologyHost 按主机聚合的拓扑：一台主机上承载了哪些实例。
 type TopologyHost struct {
 	HostIP        string  `json:"hostIp"`
+	RawHostIP     string  `json:"rawHostIp,omitempty"`
 	Hostname      string  `json:"hostname"`
 	SSHStatus     string  `json:"sshStatus"`
 	CPUCores      int     `json:"cpuCores"`
@@ -1423,14 +1483,31 @@ func (s *ClusterService) Topology(ctx context.Context, id int64) (*TopologyResul
 		return nil, apperr.Internal("查询实例失败")
 	}
 
+	// 地址映射：拓扑展示的是「TMP 视角可达的地址」。原始地址保留在 RawHostIP 里，
+	// 主机元信息也要按映射后的 IP 关联，否则映射生效后会丢主机名 / CPU / 内存。
+	mp := s.addrMapper(ctx, id)
+	displayIP := func(raw string) (mapped, original string) {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return "unknown", ""
+		}
+		if m, ok := mp.MapIP(v); ok {
+			return m, v
+		}
+		return v, ""
+	}
+
 	byComp := map[string][]TopologyNode{}
 	compOrder := []string{}
 	byHost := map[string][]TopologyNode{}
 	hostOrder := []string{}
+	hostRawByIP := map[string]string{}
 	for _, inst := range list {
+		ip, raw := displayIP(inst.HostIP)
 		node := TopologyNode{
 			ID:         inst.ID,
-			HostIP:     inst.HostIP,
+			HostIP:     ip,
+			RawHostIP:  raw,
 			Component:  inst.Component,
 			Port:       inst.Port,
 			StatusPort: inst.StatusPort,
@@ -1444,12 +1521,11 @@ func (s *ClusterService) Topology(ctx context.Context, id int64) (*TopologyResul
 		}
 		byComp[inst.Component] = append(byComp[inst.Component], node)
 
-		ip := strings.TrimSpace(inst.HostIP)
-		if ip == "" {
-			ip = "unknown"
-		}
 		if _, ok := byHost[ip]; !ok {
 			hostOrder = append(hostOrder, ip)
+			if raw != "" {
+				hostRawByIP[ip] = raw
+			}
 		}
 		byHost[ip] = append(byHost[ip], node)
 	}
@@ -1470,10 +1546,15 @@ func (s *ClusterService) Topology(ctx context.Context, id int64) (*TopologyResul
 	}
 
 	// 主机元信息（主机名 / SSH / CPU / 内存）按 IP 关联，取不到就用占位值。
+	// 映射生效时按「映射后的 IP」建索引，与上面 byHost 的键保持一致。
 	metaByIP := map[string]model.Host{}
 	if hosts, herr := s.hosts.ListByCluster(ctx, id); herr == nil {
 		for _, h := range hosts {
-			metaByIP[h.IP] = h
+			key := h.IP
+			if m, ok := mp.MapIP(key); ok {
+				key = m
+			}
+			metaByIP[key] = h
 		}
 	}
 
@@ -1486,7 +1567,7 @@ func (s *ClusterService) Topology(ctx context.Context, id int64) (*TopologyResul
 	}
 	for _, ip := range hostOrder {
 		nodes := byHost[ip]
-		h := TopologyHost{HostIP: ip, InstanceCount: len(nodes), Instances: nodes}
+		h := TopologyHost{HostIP: ip, RawHostIP: hostRawByIP[ip], InstanceCount: len(nodes), Instances: nodes}
 		if m, ok := metaByIP[ip]; ok {
 			h.Hostname = m.Hostname
 			h.SSHStatus = m.SSHStatus
@@ -1547,6 +1628,14 @@ func (s *ClusterService) Instances(ctx context.Context, id int64, f repo.Instanc
 	list, total, err := s.instances.List(ctx, id, f)
 	if err != nil {
 		return nil, apperr.Internal("查询实例失败")
+	}
+	// 地址映射：展示可达地址，原始内网地址留在 RawHostIP。
+	mp := s.addrMapper(ctx, id)
+	for i := range list {
+		if mapped, ok := mp.MapIP(list[i].HostIP); ok {
+			list[i].RawHostIP = list[i].HostIP
+			list[i].HostIP = mapped
+		}
 	}
 	res := repo.NewListResult(list, total, f.Page)
 	return &res, nil

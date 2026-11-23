@@ -16,7 +16,16 @@
     <el-table v-loading="loading" :data="rows" size="small" empty-text="暂无实例数据">
       <el-table-column prop="component" label="组件" width="120" />
       <el-table-column label="地址" min-width="180">
-        <template #default="{ row }"><span class="mono">{{ row.hostIp }}:{{ row.port }}</span></template>
+        <template #default="{ row }">
+          <span class="mono">{{ row.hostIp }}:{{ row.port }}</span>
+          <el-tooltip
+            v-if="row.rawHostIp"
+            :content="`已按地址映射显示可达地址，集群内网地址为 ${row.rawHostIp}`"
+            placement="top"
+          >
+            <el-tag size="small" type="success" effect="plain" style="margin-left: 6px">已映射</el-tag>
+          </el-tooltip>
+        </template>
       </el-table-column>
       <el-table-column prop="statusPort" label="状态端口" width="110" />
       <el-table-column label="状态" width="110">

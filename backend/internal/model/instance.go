@@ -27,9 +27,12 @@ type Instance struct {
 	DeployDir  string     `gorm:"column:deploy_dir;type:text" json:"deployDir"`
 	DataDir    string     `gorm:"column:data_dir;type:text" json:"dataDir"`
 	Raw        string     `gorm:"column:raw;type:text" json:"-"`
-	FetchedAt  time.Time  `gorm:"column:fetched_at;not null" json:"fetchedAt"`
-	CreatedAt  time.Time  `gorm:"column:created_at;not null" json:"createdAt"`
-	UpdatedAt  time.Time  `gorm:"column:updated_at;not null" json:"updatedAt"`
+	// RawHostIP 采集到的原始地址，仅在地址映射生效且改写成功时填写（不落库）。
+	// 便于界面标注「显示的是可达地址，原始地址是内网平面」。
+	RawHostIP string    `gorm:"-" json:"rawHostIp,omitempty"`
+	FetchedAt time.Time `gorm:"column:fetched_at;not null" json:"fetchedAt"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"createdAt"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updatedAt"`
 }
 
 // TableName 固定表名。

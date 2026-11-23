@@ -44,7 +44,9 @@ type Deps struct {
 	TiDBObj   *repo.TiDBObjRepo
 	Settings  *repo.SettingRepo
 	Inspect   *repo.InspectRepo
-	Cipher    *crypto.Cipher
+	// AddrMaps 地址映射规则：多网络平面下把内网地址换成 TMP 可达地址后再拨号 / 请求。
+	AddrMaps *repo.AddrMapRepo
+	Cipher   *crypto.Cipher
 
 	// Collector 返回当前模式（真实 / 演示）下的采集器。
 	Collector func() collector.Collector

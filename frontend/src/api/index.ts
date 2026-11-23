@@ -1,6 +1,8 @@
 import { request, rawClient, type PageData } from './http'
 import type {
   AboutInfo,
+  AddrMapPreview,
+  AddrMapRow,
   AuditLogRow,
   Capabilities,
   ClusterBrief,
@@ -47,6 +49,8 @@ export interface ClusterDetail extends ClusterBrief {
   prometheusUrls?: string[]
   grafanaUrls?: string[]
   alertmanagerUrls?: string[]
+  /** 该集群配置了启用的地址映射规则，上面的地址已改写为 TMP 可达地址。 */
+  addrMapped?: boolean
   capabilities?: Capabilities
   credentials?: {
     hasSshPassword: boolean
@@ -269,6 +273,21 @@ export const clusterApi = {
     request<unknown>({ url: `/clusters/${id}/metrics`, method: 'get', params: { range } }),
   /** 告警列表：后端直接返回裸数组（OK(c, list)），不套 { list } 包装。 */
   alerts: (id: number) => request<unknown[]>({ url: `/clusters/${id}/alerts`, method: 'get' }),
+
+  // ---- 地址映射（多网络平面：把集群内网地址改写为 TMP 可达地址） ----
+  addrMaps: (id: number) =>
+    request<{ list: AddrMapRow[] }>({ url: `/clusters/${id}/addr-maps`, method: 'get' }),
+  createAddrMap: (id: number, data: { source: string; target: string; note?: string; enabled?: boolean }) =>
+    request<AddrMapRow>({ url: `/clusters/${id}/addr-maps`, method: 'post', data }),
+  updateAddrMap: (
+    id: number,
+    mapId: number,
+    data: { source: string; target: string; note?: string; enabled?: boolean },
+  ) => request<AddrMapRow>({ url: `/clusters/${id}/addr-maps/${mapId}`, method: 'put', data }),
+  deleteAddrMap: (id: number, mapId: number) =>
+    request<null>({ url: `/clusters/${id}/addr-maps/${mapId}`, method: 'delete' }),
+  previewAddrMap: (id: number, address: string) =>
+    request<AddrMapPreview>({ url: `/clusters/${id}/addr-maps/preview`, method: 'post', data: { address } }),
 }
 
 // ---------------------------------------------------------------------------

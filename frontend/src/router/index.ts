@@ -96,6 +96,13 @@ const routes: RouteRecordRaw[] = [
             meta: { title: '集群巡检', action: 'report.view' },
           },
           {
+            path: 'addr-maps',
+            name: 'cluster-addr-maps',
+            component: () => import('@/views/cluster/ClusterAddrMapsTab.vue'),
+            props: (route) => ({ clusterId: Number(route.params.id) }),
+            meta: { title: '地址映射', action: 'cluster.view' },
+          },
+          {
             path: 'changes',
             name: 'cluster-changes',
             component: () => import('@/views/cluster/ClusterChangesTab.vue'),

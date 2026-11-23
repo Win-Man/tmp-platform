@@ -27,6 +27,7 @@ type Handlers struct {
 	Creds    *service.CredentialService
 	Overview *service.OverviewService
 	Audit    *service.AuditService
+	AddrMaps *service.AddrMapService
 	MockMode bool
 }
 

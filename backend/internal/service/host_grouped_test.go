@@ -32,6 +32,8 @@ func groupedTestDB(t *testing.T) (*HostService, *gorm.DB) {
 		repo.NewHostRepo(gdb),
 		repo.NewInstanceRepo(gdb),
 		repo.NewClusterRepo(gdb),
+		// 分组测试不涉及地址映射，传 nil 走原样透传分支。
+		nil,
 	), gdb
 }
 

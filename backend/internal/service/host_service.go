@@ -9,6 +9,7 @@ import (
 
 	"github.com/tmp-platform/backend/internal/job"
 	"github.com/tmp-platform/backend/internal/model"
+	"github.com/tmp-platform/backend/internal/pkg/addrmap"
 	"github.com/tmp-platform/backend/internal/pkg/apperr"
 	"github.com/tmp-platform/backend/internal/repo"
 )
@@ -19,11 +20,13 @@ type HostService struct {
 	instances *repo.InstanceRepo
 	clusters  *repo.ClusterRepo
 	engine    *job.Engine
+	// addrMaps 地址映射规则仓储；为 nil 时不标注映射地址（单测场景）。
+	addrMaps *repo.AddrMapRepo
 }
 
 // NewHostService 构造主机服务。
-func NewHostService(hosts *repo.HostRepo, instances *repo.InstanceRepo, clusters *repo.ClusterRepo) *HostService {
-	return &HostService{hosts: hosts, instances: instances, clusters: clusters}
+func NewHostService(hosts *repo.HostRepo, instances *repo.InstanceRepo, clusters *repo.ClusterRepo, addrMaps *repo.AddrMapRepo) *HostService {
+	return &HostService{hosts: hosts, instances: instances, clusters: clusters, addrMaps: addrMaps}
 }
 
 // SetEngine 注入任务引擎。
@@ -38,8 +41,61 @@ func (s *HostService) List(ctx context.Context, f repo.HostFilter) (*repo.ListRe
 	if err != nil {
 		return nil, apperr.Internal("查询主机列表失败")
 	}
+	s.fillMappedIP(ctx, rows, 0)
 	res := repo.NewListResult(rows, total, f.Page)
 	return &res, nil
+}
+
+// addrMappers 一次性加载所有启用规则，按集群构建映射器。
+//
+// 主机列表不分集群，逐台去查规则会形成 N+1；规则表很小，一次全量读取更划算。
+func (s *HostService) addrMappers(ctx context.Context) map[int64]*addrmap.Mapper {
+	if s.addrMaps == nil {
+		return nil
+	}
+	list, err := s.addrMaps.ListAllEnabled(ctx)
+	if err != nil || len(list) == 0 {
+		return nil
+	}
+	grouped := map[int64][]model.ClusterAddrMap{}
+	for _, m := range list {
+		grouped[m.ClusterID] = append(grouped[m.ClusterID], m)
+	}
+	out := make(map[int64]*addrmap.Mapper, len(grouped))
+	for cid, rules := range grouped {
+		out[cid] = BuildAddrMapper(rules)
+	}
+	return out
+}
+
+// fillMappedIP 给主机行补上「映射后可访问地址」。
+//
+// clusterID > 0 时按该集群的规则映射；为 0 时只对「仅属于一个集群」的主机推断，
+// 因为同一台机器在不同集群里可能有不同映射，猜错比留空更危险。
+func (s *HostService) fillMappedIP(ctx context.Context, rows []repo.HostRow, clusterID int64) {
+	if s.addrMaps == nil || len(rows) == 0 {
+		return
+	}
+	mappers := s.addrMappers(ctx)
+	if len(mappers) == 0 {
+		return
+	}
+	for i := range rows {
+		cid := clusterID
+		if cid == 0 {
+			if len(rows[i].ClusterIDs) != 1 {
+				continue
+			}
+			cid = rows[i].ClusterIDs[0]
+		}
+		mp := mappers[cid]
+		if mp.Empty() {
+			continue
+		}
+		if mapped, ok := mp.MapIP(rows[i].IP); ok {
+			rows[i].MappedIP = mapped
+		}
+	}
 }
 
 // ClusterHostGroup 按集群分组的主机视图。
@@ -83,7 +139,10 @@ func (s *HostService) Grouped(ctx context.Context, f repo.HostFilter) ([]Cluster
 	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
 	out := make([]ClusterHostGroup, 0, len(order)+1)
 	for _, cid := range order {
-		out = append(out, ClusterHostGroup{ClusterID: cid, ClusterName: nameByID[cid], Hosts: groups[cid]})
+		hosts := groups[cid]
+		// 分组视图本身就是「按集群看」，可以放心用该集群的映射规则。
+		s.fillMappedIP(ctx, hosts, cid)
+		out = append(out, ClusterHostGroup{ClusterID: cid, ClusterName: nameByID[cid], Hosts: hosts})
 	}
 	if len(unassigned) > 0 {
 		out = append(out, ClusterHostGroup{ClusterID: 0, ClusterName: "未关联集群", Hosts: unassigned})

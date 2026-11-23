@@ -109,6 +109,7 @@ func run() error {
 	jobRepo := repo.NewJobRepo(gdb)
 	tidbRepo := repo.NewTiDBObjRepo(gdb)
 	inspectRepo := repo.NewInspectRepo(gdb)
+	addrMapRepo := repo.NewAddrMapRepo(gdb)
 
 	jwtMgr := auth.NewManager(jwtSecret, jwtTTL(bootCtx, settingRepo, log))
 
@@ -127,10 +128,12 @@ func run() error {
 		Clusters: clusterRepo, Instances: instanceRepo, Hosts: hostRepo,
 		Creds: credRepo, Jobs: jobRepo, Audits: auditRepo,
 		Settings: settingSvc, Mode: mode, Cipher: cipher, TiDBObj: tidbRepo,
+		AddrMaps: addrMapRepo,
 		// 连接测试凭证与 JWT 同源派生（TMP_SECRET 或 secret.key），重启后旧凭证仍可校验。
 		ProbeTokens: service.NewProbeTokenSigner(jwtSecret),
 	})
-	hostSvc := service.NewHostService(hostRepo, instanceRepo, clusterRepo)
+	hostSvc := service.NewHostService(hostRepo, instanceRepo, clusterRepo, addrMapRepo)
+	addrMapSvc := service.NewAddrMapService(addrMapRepo, clusterRepo)
 	tidbObjSvc := service.NewTiDBObjService(clusterRepo, credRepo, tidbRepo, cipher, mode)
 	inspectSvc := service.NewInspectService(service.InspectDeps{
 		Repo: inspectRepo, Clusters: clusterRepo, Creds: credRepo,
@@ -144,7 +147,8 @@ func run() error {
 	engine := job.NewEngine(job.Deps{
 		Repo: jobRepo, Clusters: clusterRepo, Instances: instanceRepo, Hosts: hostRepo,
 		Creds: credRepo, TiDBObj: tidbRepo, Settings: settingRepo, Inspect: inspectRepo,
-		Cipher: cipher, Collector: mode.Current, IsMock: mode.IsMock, Log: log,
+		AddrMaps: addrMapRepo,
+		Cipher:   cipher, Collector: mode.Current, IsMock: mode.IsMock, Log: log,
 	}, defaultWorkers)
 	// 端口后注入，打破 service ↔ job 的构造期循环依赖。
 	// 统一走 EngineBindable 列表 + 自检：漏掉任何一个持有 engine 的服务，
@@ -187,7 +191,7 @@ func run() error {
 		Config: cfg, Mode: mode, Auth: authSvc, Users: userSvc,
 		Clusters: clusterSvc, Hosts: hostSvc, TiDBObj: tidbObjSvc,
 		Inspect: inspectSvc, Jobs: jobSvc, Settings: settingSvc,
-		Creds: credSvc, Overview: overviewSvc, Audit: auditSvc,
+		Creds: credSvc, Overview: overviewSvc, Audit: auditSvc, AddrMaps: addrMapSvc,
 		MockMode: mode.IsMock(),
 	}
 	router := api.NewRouter(api.RouterDeps{

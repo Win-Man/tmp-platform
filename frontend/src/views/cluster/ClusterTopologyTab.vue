@@ -23,6 +23,13 @@
             <el-icon class="host-icon"><Monitor /></el-icon>
             <span class="host-name">{{ host.hostname || host.hostIp }}</span>
             <span v-if="host.hostname" class="text-muted mono host-ip">{{ host.hostIp }}</span>
+            <el-tooltip
+              v-if="host.rawHostIp"
+              :content="`已按地址映射显示可达地址，集群内网地址为 ${host.rawHostIp}`"
+              placement="top"
+            >
+              <el-tag size="small" type="success" effect="plain">已映射</el-tag>
+            </el-tooltip>
           </div>
           <div class="host-tags">
             <el-tag size="small" effect="plain">{{ host.instanceCount }} 实例</el-tag>
@@ -75,6 +82,13 @@
             <div class="node-line">
               <span class="status-dot" :class="statusDot(node.status)" />
               <span class="mono">{{ node.hostIp }}:{{ node.port }}</span>
+              <el-tooltip
+                v-if="node.rawHostIp"
+                :content="`集群内网地址：${node.rawHostIp}`"
+                placement="top"
+              >
+                <span class="mapped-dot">映射</span>
+              </el-tooltip>
             </div>
             <div class="node-meta">
               <el-tag size="small" effect="plain" :type="node.role === 'leader' ? 'warning' : 'info'">
@@ -318,5 +332,16 @@ onMounted(() => {
 .node-az {
   margin-top: 4px;
   font-size: 12px;
+}
+
+/* 地址被映射改写时的小标记：只做提示，不抢主信息的视觉权重 */
+.mapped-dot {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--el-color-success);
+  border: 1px solid var(--el-color-success-light-5);
+  border-radius: 3px;
+  padding: 1px 3px;
+  cursor: help;
 }
 </style>

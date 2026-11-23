@@ -74,9 +74,20 @@
           @selection-change="onSelectionChange"
         >
           <el-table-column type="selection" width="44" />
-          <el-table-column label="主机" min-width="180">
+          <el-table-column label="主机" min-width="210">
             <template #default="{ row }">
-              <div class="mono">{{ row.ip }}</div>
+              <div class="mono">
+                {{ row.ip }}
+                <el-tooltip
+                  v-if="row.mappedIp"
+                  :content="`访问时实际连接 ${row.mappedIp}（地址映射规则生效，SSH 检测也走该地址）`"
+                  placement="top"
+                >
+                  <el-tag size="small" type="success" effect="plain" style="margin-left: 6px">
+                    → {{ row.mappedIp }}
+                  </el-tag>
+                </el-tooltip>
+              </div>
               <div class="text-muted" style="font-size: 12px">{{ row.hostname || '—' }}</div>
             </template>
           </el-table-column>
@@ -165,9 +176,18 @@
               <span class="text-muted">{{ group.hosts.length }} 台主机</span>
             </div>
             <el-table :data="group.hosts" size="small">
-              <el-table-column label="主机" min-width="180">
+              <el-table-column label="主机" min-width="210">
                 <template #default="{ row }">
                   <span class="mono">{{ row.ip }}</span>
+                  <el-tooltip
+                    v-if="row.mappedIp"
+                    :content="`访问时实际连接 ${row.mappedIp}（地址映射规则生效）`"
+                    placement="top"
+                  >
+                    <el-tag size="small" type="success" effect="plain" style="margin-left: 6px">
+                      → {{ row.mappedIp }}
+                    </el-tag>
+                  </el-tooltip>
                   <span class="text-muted" style="margin-left: 8px">{{ row.hostname }}</span>
                 </template>
               </el-table-column>

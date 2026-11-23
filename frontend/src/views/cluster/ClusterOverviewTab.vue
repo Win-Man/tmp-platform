@@ -21,12 +21,29 @@
           <div class="detail-item"><span class="detail-label">TiUP 目录</span><span class="detail-value mono">{{ cluster?.tiupDir || '—' }}</span></div>
           <div class="detail-item"><span class="detail-label">DB 地址</span><span class="detail-value mono">{{ cluster?.dbHost }}:{{ cluster?.dbPort }}</span></div>
           <div class="detail-item"><span class="detail-label">DB 用户</span><span class="detail-value">{{ cluster?.dbUser }}</span></div>
-          <div class="detail-item"><span class="detail-label">PD 地址</span><span class="detail-value mono">{{ cluster?.pdEndpoint || '—' }}</span></div>
+          <div class="detail-item">
+            <span class="detail-label">PD 地址</span>
+            <span class="detail-value mono">
+              {{ cluster?.pdEndpoint || '—' }}
+              <el-tooltip
+                v-if="cluster?.addrMapped"
+                content="已按「地址映射」规则改写为 TMP 可达地址；采集快照里仍是集群内网地址"
+                placement="top"
+              >
+                <el-tag type="success" size="small" effect="plain" class="ml">已映射</el-tag>
+              </el-tooltip>
+            </span>
+          </div>
           <div class="detail-item"><span class="detail-label">CPU 架构</span><span class="detail-value">{{ cluster?.cpuArch }}</span></div>
           <div class="detail-item"><span class="detail-label">部署模式</span><span class="detail-value">{{ enums.label('deployMode', cluster?.deployMode || 'unknown') }}</span></div>
         </div>
 
-        <h4 class="section-title mt-16">访问入口</h4>
+        <h4 class="section-title mt-16">
+          访问入口
+          <el-tag v-if="cluster?.addrMapped" type="success" size="small" effect="plain" class="ml">
+            已地址映射
+          </el-tag>
+        </h4>
         <div class="detail-grid">
           <div class="detail-item">
             <span class="detail-label">Dashboard</span>

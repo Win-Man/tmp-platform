@@ -8,12 +8,13 @@ import (
 	"github.com/tmp-platform/backend/internal/model"
 )
 
-// Models 返回全部 19 张表对应的 GORM 模型。
+// Models 返回全部表对应的 GORM 模型。
 func Models() []any {
 	return []any{
 		&model.PlatformUser{},
 		&model.Cluster{},
 		&model.ClusterCredential{},
+		&model.ClusterAddrMap{},
 		&model.Host{},
 		&model.Instance{},
 		&model.TiDBUser{},
@@ -45,6 +46,10 @@ var indexDDL = []string{
 	`CREATE INDEX IF NOT EXISTS idx_clusters_deleted ON clusters(deleted_at)`,
 
 	`CREATE UNIQUE INDEX IF NOT EXISTS uk_cred_cluster ON cluster_credentials(cluster_id)`,
+
+	// 同一集群内一个源地址只能有一条规则（规范化后按源地址判重）。
+	`CREATE UNIQUE INDEX IF NOT EXISTS uk_addr_maps ON cluster_addr_maps(cluster_id, source)`,
+	`CREATE INDEX IF NOT EXISTS idx_addr_maps_cluster ON cluster_addr_maps(cluster_id)`,
 
 	`CREATE UNIQUE INDEX IF NOT EXISTS uk_hosts_ip ON hosts(ip)`,
 	`CREATE INDEX IF NOT EXISTS idx_hosts_arch ON hosts(cpu_arch)`,

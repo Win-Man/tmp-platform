@@ -61,6 +61,9 @@ type HostRow struct {
 	ClusterIDs    []int64  `json:"clusterIds"`
 	// Clusters 所属集群明细（含中控机），前端据此区分同名集群。
 	Clusters []HostClusterBrief `json:"clusters"`
+	// MappedIP 地址映射后的可达地址。仅当能确定所属集群（分组视图或唯一归属）时填写，
+	// 用于在主机管理页提示「这台机器的内网地址实际走这个地址访问」。
+	MappedIP string `json:"mappedIp,omitempty"`
 }
 
 // applyHostFilter 把主机筛选条件应用到查询（List 与 ListAll 共用，避免两处维护）。

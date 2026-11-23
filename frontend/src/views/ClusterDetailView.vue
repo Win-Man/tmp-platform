@@ -122,6 +122,7 @@ const allTabs = [
   { name: 'params', label: '参数', action: 'variable.view' },
   { name: 'performance', label: '性能', action: 'cluster.view' },
   { name: 'inspection', label: '巡检', action: 'report.view' },
+  { name: 'addr-maps', label: '地址映射', action: 'cluster.view' },
   { name: 'changes', label: '变更记录', action: 'cluster.view' },
 ] as const
 

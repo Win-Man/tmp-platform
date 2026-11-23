@@ -108,6 +108,13 @@ func NewRouter(d RouterDeps) *gin.Engine {
 		authed.GET("/clusters/:id/metrics", auth.Require(auth.ActionClusterView), h.ClusterMetrics)
 		authed.GET("/clusters/:id/alerts", auth.Require(auth.ActionClusterView), h.ClusterAlerts)
 
+		// 地址映射：多网络平面下把集群内网地址改写为 TMP 可达地址（读与连接均生效）
+		authed.GET("/clusters/:id/addr-maps", auth.Require(auth.ActionClusterView), h.ListAddrMaps)
+		authed.POST("/clusters/:id/addr-maps", auth.Require(auth.ActionClusterEdit), h.CreateAddrMap)
+		authed.POST("/clusters/:id/addr-maps/preview", auth.Require(auth.ActionClusterView), h.PreviewAddrMap)
+		authed.PUT("/clusters/:id/addr-maps/:mapId", auth.Require(auth.ActionClusterEdit), h.UpdateAddrMap)
+		authed.DELETE("/clusters/:id/addr-maps/:mapId", auth.Require(auth.ActionClusterEdit), h.DeleteAddrMap)
+
 		// TiDB 对象：用户 / Resource Group / 会话 / 参数 / 慢查询
 		authed.GET("/clusters/:id/tidb-users", auth.Require(auth.ActionTiDBUserView), h.ListTiDBUsers)
 		authed.POST("/clusters/:id/tidb-users", auth.Require(auth.ActionTiDBUserCreate), h.CreateTiDBUser)

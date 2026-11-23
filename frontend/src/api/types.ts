@@ -108,9 +108,36 @@ export interface ClusterOption {
   draft?: boolean
 }
 
+/** 集群地址映射规则：把集群内网平面地址映射为 TMP 可达地址。 */
+export interface AddrMapRow {
+  id: number
+  clusterId: number
+  /** 源地址：精确 IP（10.10.9.11）、CIDR（10.10.9.0/24）或简写前缀（10.10.9.）。 */
+  source: string
+  /** 目标地址，形态需与 source 一致。 */
+  target: string
+  note?: string
+  /** 1 启用 / 0 停用。 */
+  enabled: number
+  createdBy?: number | null
+  createdAt?: string
+  updatedAt?: string
+}
+
+/** 地址映射试算结果。 */
+export interface AddrMapPreview {
+  input: string
+  mapped: string
+  matched: boolean
+  source: string
+  target: string
+}
+
 export interface TopologyNode {
   id: number
   hostIp: string
+  /** 采集到的原始地址；地址映射生效时才返回（供界面标注内网地址）。 */
+  rawHostIp?: string
   /** 实例所属组件（pd / tidb / tikv / ...），按主机视角渲染时必需。 */
   component: string
   port: number
@@ -130,6 +157,8 @@ export interface TopologyGroup {
 /** 按主机聚合的拓扑：一台主机承载的所有实例。 */
 export interface TopologyHost {
   hostIp: string
+  /** 采集到的原始地址；地址映射生效时才返回。 */
+  rawHostIp?: string
   hostname: string
   /** ok / fail / unknown */
   sshStatus: string
@@ -152,6 +181,8 @@ export interface InstanceRow {
   clusterId: number
   component: string
   hostIp: string
+  /** 采集到的原始地址；地址映射生效时才返回。 */
+  rawHostIp?: string
   port: number
   statusPort: number
   status: string
@@ -275,6 +306,8 @@ export interface HostRow {
   clusterIds?: number[]
   /** 所属集群明细：一台主机可同时属于多套集群，且不同中控机上可能有同名集群。 */
   clusters?: HostClusterBrief[]
+  /** 地址映射后的可达地址（仅当能确定所属集群且规则命中时返回）。 */
+  mappedIp?: string
 }
 
 export interface JobRow {

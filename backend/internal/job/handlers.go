@@ -10,6 +10,7 @@ import (
 
 	"github.com/tmp-platform/backend/internal/collector"
 	"github.com/tmp-platform/backend/internal/model"
+	"github.com/tmp-platform/backend/internal/pkg/addrmap"
 	"github.com/tmp-platform/backend/internal/pkg/apperr"
 	"github.com/tmp-platform/backend/internal/pkg/sqlsafe"
 	"github.com/tmp-platform/backend/internal/pkg/sshcmd"
@@ -497,8 +498,15 @@ func (e *Engine) probeHostSSH(ctx context.Context, h *model.Host) error {
 	if user == "" {
 		user = target.TiUPUser
 	}
+	// 主机 IP 来自采集快照（部署平面地址），多网络平面下需换成 TMP 可达地址再拨号。
+	dialIP := h.IP
+	if mp := e.addrMapper(ctx, cluster.ID); !mp.Empty() {
+		if mapped, ok := mp.MapIP(dialIP); ok {
+			dialIP = mapped
+		}
+	}
 	runner, derr := sshcmd.Dial(sshcmd.DialOptions{
-		Host:       h.IP,
+		Host:       dialIP,
 		Port:       22,
 		User:       user,
 		Password:   target.TiUPPassword,
@@ -876,7 +884,31 @@ func (e *Engine) buildTarget(ctx context.Context, cluster *model.Cluster) (*coll
 	if err != nil && !errors.Is(err, repo.ErrNotFound) {
 		return nil, fmt.Errorf("读取凭据失败: %w", err)
 	}
-	return collector.NewTarget(cluster, cred, e.deps.Cipher), nil
+	t := collector.NewTarget(cluster, cred, e.deps.Cipher)
+	// PD 地址通常是采集期从 meta.yaml 自动发现的，可能落在不可达的内网平面；
+	// 这里按映射规则换成可达地址后再请求。TiUP / DB 地址是用户录入的，必须已可达，不改写。
+	if mp := e.addrMapper(ctx, cluster.ID); !mp.Empty() {
+		if host, ok := mp.MapIP(t.PDHost); ok {
+			t.PDHost = host
+		}
+	}
+	return t, nil
+}
+
+// addrMapper 构建集群的地址映射器；未接入映射或没有启用规则时返回 nil（原样透传）。
+func (e *Engine) addrMapper(ctx context.Context, clusterID int64) *addrmap.Mapper {
+	if e.deps.AddrMaps == nil {
+		return nil
+	}
+	list, err := e.deps.AddrMaps.ListEnabled(ctx, clusterID)
+	if err != nil || len(list) == 0 {
+		return nil
+	}
+	rules := make([]addrmap.Rule, 0, len(list))
+	for _, m := range list {
+		rules = append(rules, addrmap.Rule{Source: m.Source, Target: m.Target})
+	}
+	return addrmap.New(rules)
 }
 
 // decodePayload 解析任务入参。
