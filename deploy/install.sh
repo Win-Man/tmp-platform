@@ -9,6 +9,10 @@
 #   sudo ./install.sh --user tiup              # 用已有用户运行（按内网账号规范选填）
 #   sudo ./install.sh --no-systemd             # 只铺文件，不注册服务（容器/无 systemd 环境）
 #
+# 升级：对已安装的机器再执行一次即可 —— 保留 tmp.env 与 data/，自动备份旧二进制
+# 与升级前的 tmp.db/secret.key 到 <prefix>/backup（仅留最近 3 份），然后重启服务。
+# 回滚：把 <prefix>/backup/tmp.bin.<时间戳> 拷回 <prefix>/bin/tmp 再重启。
+#
 # 脚本只使用系统自带命令（bash/coreutils/systemctl），不依赖网络。
 set -euo pipefail
 
@@ -25,7 +29,8 @@ info()    { printf '  %s\n' "$*"; }
 die()     { c_red "错误：$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  # 打印文件开头的注释块（到第一个非注释行为止），避免行号写死后漏内容
+  awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
   exit 0
 }
 
@@ -54,6 +59,12 @@ TPL_SERVICE="$SCRIPT_DIR/tmp.service"
 TPL_ENV="$SCRIPT_DIR/tmp.env.example"
 [ -f "$TPL_SERVICE" ] || die "缺少模板 $TPL_SERVICE"
 
+# 包内 VERSION 由 scripts/build-offline.sh 写入，仅用于展示
+PKG_VERSION=""
+if [ -f "$SCRIPT_DIR/VERSION" ]; then
+  PKG_VERSION="$(head -n 1 "$SCRIPT_DIR/VERSION" | tr -d '[:space:]')"
+fi
+
 # ---------- 架构预检 ----------
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -61,7 +72,7 @@ case "$ARCH" in
   *) c_yellow "警告：当前架构 $ARCH 与本包（x86_64）不符，二进制可能无法运行" ;;
 esac
 
-echo "==> 安装 TMP 到 ${PREFIX}（端口 ${PORT}，运行用户 ${RUN_USER}）"
+echo "==> 安装 TMP 到 ${PREFIX}（端口 ${PORT}，运行用户 ${RUN_USER}${PKG_VERSION:+，版本 ${PKG_VERSION}}）"
 
 # ---------- 运行用户 ----------
 if id "$RUN_USER" >/dev/null 2>&1; then
@@ -76,11 +87,47 @@ else
   fi
 fi
 
+# ---------- 升级预检：已装则先停服并备份 ----------
+#
+# 覆盖运行中的二进制会报 "Text file busy"（ETXTBSY），所以必须先停服务；
+# 停服后数据库没有 WAL 写入，此刻的 tmp.db 拷贝才是完整可回滚的。
+UPGRADE="0"
+if [ -f "$PREFIX/bin/tmp" ]; then
+  UPGRADE="1"
+  TS="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$PREFIX/backup"
+
+  if [ "$USE_SYSTEMD" = "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl stop "$SERVICE_NAME"
+    info "已停止服务 $SERVICE_NAME（升级中）"
+  fi
+
+  cp -p "$PREFIX/bin/tmp" "$PREFIX/backup/tmp.bin.$TS"
+  info "检测到已有安装，已备份旧二进制到 $PREFIX/backup/tmp.bin.$TS"
+  if [ -f "$PREFIX/data/tmp.db" ]; then
+    cp -p "$PREFIX/data/tmp.db" "$PREFIX/backup/tmp.db.$TS"
+    info "已备份数据库到 $PREFIX/backup/tmp.db.$TS"
+  fi
+  if [ -f "$PREFIX/data/secret.key" ]; then
+    cp -p "$PREFIX/data/secret.key" "$PREFIX/backup/secret.key.$TS"
+  fi
+
+  # 只保留最近 3 份备份，避免反复升级把磁盘占满
+  ls -1t "$PREFIX/backup"/tmp.bin.* 2>/dev/null | tail -n +4 | xargs rm -f || true
+  ls -1t "$PREFIX/backup"/tmp.db.* 2>/dev/null | tail -n +4 | xargs rm -f || true
+  ls -1t "$PREFIX/backup"/secret.key.* 2>/dev/null | tail -n +4 | xargs rm -f || true
+fi
+
 # ---------- 目录与二进制 ----------
 mkdir -p "$PREFIX/bin" "$PREFIX/data"
 install -m 0755 "$BIN_SRC" "$PREFIX/bin/tmp"
 chown -R "$RUN_USER":"$RUN_USER" "$PREFIX/data"
 chmod 0750 "$PREFIX/data"
+
+# 记录本次部署的版本（--no-systemd 也写，便于回滚时对比）
+if [ -n "$PKG_VERSION" ]; then
+  printf '%s\n' "$PKG_VERSION" > "$PREFIX/VERSION"
+fi
 
 # ---------- 环境变量文件（已存在则不覆盖，避免覆盖现场配置） ----------
 if [ -f "$PREFIX/tmp.env" ]; then
@@ -139,7 +186,11 @@ done
 
 echo
 if [ "$READY" = "1" ]; then
-  c_green "✔ 安装完成，服务已就绪"
+  if [ "$UPGRADE" = "1" ]; then
+    c_green "✔ 升级完成，服务已就绪（数据与配置沿用原有目录）"
+  else
+    c_green "✔ 安装完成，服务已就绪"
+  fi
 else
   c_yellow "⚠ 服务未在 30s 内通过 /readyz 检查，请查看日志排错"
 fi
@@ -153,6 +204,16 @@ cat <<EOF
   安装目录   $PREFIX
   配置文件   $PREFIX/tmp.env
   数据目录   $PREFIX/data（含 tmp.db 与 secret.key）
+EOF
+
+if [ -n "$PKG_VERSION" ]; then
+  echo "  当前版本   $PKG_VERSION"
+fi
+if [ "$UPGRADE" = "1" ]; then
+  echo "  升级备份   $PREFIX/backup（旧二进制 + 升级前的 tmp.db / secret.key）"
+fi
+
+cat <<EOF
 
   常用命令
     systemctl status  $SERVICE_NAME

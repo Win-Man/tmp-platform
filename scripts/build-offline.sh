@@ -2,8 +2,8 @@
 #
 # 构建离线部署包（在联网/有工具链的构建机上执行）
 #
-#   ./scripts/build-offline.sh                 # 默认 1.0.0-mvp / linux-amd64
-#   VERSION=1.0.1 ./scripts/build-offline.sh   # 指定版本号
+#   ./scripts/build-offline.sh                 # 默认 1.0.1-mvp / linux-amd64
+#   VERSION=1.0.2 ./scripts/build-offline.sh   # 指定版本号
 #   GOARCH=arm64 ./scripts/build-offline.sh    # 交叉编译到 ARM64
 #
 # 产物：dist/tmp-<version>-linux-<arch>.tar.gz（内含二进制、systemd 单元、安装脚本、部署手册）
@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 APP="tmp"
-VERSION="${VERSION:-1.0.0-mvp}"
+VERSION="${VERSION:-1.0.1-mvp}"
 GOOS="${GOOS:-linux}"
 GOARCH="${GOARCH:-amd64}"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -50,6 +50,9 @@ install -m 0644 "$ROOT/deploy/tmp.env.example"    "$STAGE/tmp.env.example"
 if [ -f "$ROOT/deploy/README-DEPLOY.md" ]; then
   install -m 0644 "$ROOT/deploy/README-DEPLOY.md" "$STAGE/README-DEPLOY.md"
 fi
+
+# 包内版本文件：install.sh 展示用，装完也会写到 <prefix>/VERSION
+printf '%s\n' "$VERSION" > "$STAGE/VERSION"
 
 echo ">> 计算校验和"
 ( cd "$STAGE" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )

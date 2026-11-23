@@ -1,6 +1,6 @@
 # TMP · TiDB 管理平台 —— X86 离线部署手册
 
-适用版本：`1.0.0-mvp` ｜ 目标平台：**Linux x86_64（amd64）** ｜ 部署方式：**单机单二进制 + 内置 SQLite**
+适用版本：`1.0.1-mvp` ｜ 目标平台：**Linux x86_64（amd64）** ｜ 部署方式：**单机单二进制 + 内置 SQLite**
 
 ---
 
@@ -23,14 +23,15 @@
 ## 2. 包内容
 
 ```
-tmp-1.0.0-mvp-linux-amd64/
+tmp-1.0.1-mvp-linux-amd64/
 ├── bin/tmp               # 静态二进制（API + 内嵌前端）
-├── install.sh            # 一键安装（systemd 托管）
+├── install.sh            # 一键安装 / 原地升级（systemd 托管）
 ├── uninstall.sh          # 卸载（默认保留数据）
 ├── start.sh              # 裸跑启动（容器 / 无 systemd）
 ├── verify.sh             # 部署前环境自检（只读，不改任何东西）
 ├── tmp.service           # systemd 单元模板
 ├── tmp.env.example       # 环境变量模板
+├── VERSION               # 包版本号（安装后写入 <prefix>/VERSION）
 ├── README-DEPLOY.md      # 本文
 └── SHA256SUMS            # 校验和
 ```
@@ -63,8 +64,8 @@ sha256sum -c SHA256SUMS
 
 ```bash
 # 1) 上传并解压
-tar -xzf tmp-1.0.0-mvp-linux-amd64.tar.gz
-cd tmp-1.0.0-mvp-linux-amd64
+tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz
+cd tmp-1.0.1-mvp-linux-amd64
 
 # 2) 校验 + 环境自检
 sha256sum -c SHA256SUMS
@@ -95,8 +96,8 @@ sudo ./install.sh --no-systemd             # 只铺文件，不注册服务
 `start.sh` 是 POSIX sh，**Alpine 等无 bash 的精简系统也能直接运行**：
 
 ```bash
-tar -xzf tmp-1.0.0-mvp-linux-amd64.tar.gz
-cd tmp-1.0.0-mvp-linux-amd64
+tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz
+cd tmp-1.0.1-mvp-linux-amd64
 
 # 前台运行（数据落在 ./data，数据库自动落在 ./data/tmp.db）
 sh ./start.sh
@@ -117,7 +118,7 @@ curl -s http://127.0.0.1:8080/readyz
 ```dockerfile
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates tzdata
-COPY tmp-1.0.0-mvp-linux-amd64/bin/tmp /usr/local/bin/tmp
+COPY tmp-1.0.1-mvp-linux-amd64/bin/tmp /usr/local/bin/tmp
 ENV TMP_ADDR=:8080 TMP_DATA_DIR=/data
 VOLUME /data
 EXPOSE 8080
@@ -189,23 +190,47 @@ journalctl -u tmp --since "1 hour ago"
 
 ## 8. 升级与回滚
 
-平台数据在 `/opt/tmp/data`，与二进制分离，**升级不动数据**。
+平台数据在 `/opt/tmp/data`，与二进制分离，**升级不动数据**。数据库迁移在启动时自动执行且幂等，不需要手工改表。
+
+### 8.1 一条命令升级（推荐）
+
+把新包解压后**直接再执行一次 `install.sh`**（参数与原安装保持一致即可）：
 
 ```bash
-# --- 升级 ---
-systemctl stop tmp
-cp /opt/tmp/bin/tmp /opt/tmp/bin/tmp.bak.$(date +%F)   # 备份旧二进制
-install -m 0755 ./bin/tmp /opt/tmp/bin/tmp              # 用自己的拷贝，不要 chown 丢失
+tar -xzf tmp-1.0.1-mvp-linux-amd64.tar.gz && cd tmp-1.0.1-mvp-linux-amd64
+sha256sum -c SHA256SUMS
+sudo ./install.sh --port 8080 --user tiup      # 参数与上次安装一致
+```
+
+脚本会自动完成：
+
+1. 检测到已有安装 → **先停服务**（覆盖运行中的二进制会报 `Text file busy`）；
+2. 备份旧二进制、升级前的 `tmp.db` 与 `secret.key` 到 `/opt/tmp/backup/`（时间戳命名，**只留最近 3 份**）；
+3. 覆盖二进制，**保留 `tmp.env` 与 `data/`**；
+4. 重启服务并等待 `/readyz` 通过，输出「✔ 升级完成」；
+5. 版本号写入 `/opt/tmp/VERSION`，也可在「系统设置 → 关于」里核对。
+
+### 8.2 手工升级（无 systemd 场景）
+
+```bash
+systemctl stop tmp                                       # 或 kill 掉裸跑进程
+cp /opt/tmp/bin/tmp /opt/tmp/backup/tmp.bin.$(date +%F)   # 备份旧二进制
+install -m 0755 ./bin/tmp /opt/tmp/bin/tmp
 systemctl start tmp
 curl -s http://127.0.0.1:8080/readyz
+```
 
-# --- 回滚 ---
+### 8.3 回滚
+
+```bash
 systemctl stop tmp
-cp /opt/tmp/bin/tmp.bak.<日期> /opt/tmp/bin/tmp
+cp /opt/tmp/backup/tmp.bin.<时间戳> /opt/tmp/bin/tmp
+# 若新版本已改过表结构，再回滚数据（注意会丢失升级后产生的数据）：
+cp /opt/tmp/backup/tmp.db.<时间戳> /opt/tmp/data/tmp.db
 systemctl start tmp
 ```
 
-> 数据库迁移是**自动且幂等**的（启动时执行），升级不需要手工改表。但**跨大版本升级前请先备份 `data/`**（见 §9）。
+> 只回滚二进制通常就够（迁移是加列/加表，旧版本能忽略新增结构）；只有新版本改动了旧表语义时才需要连数据一起回滚。**跨大版本升级前请先按 §9 打包整个 `data/`**。
 
 ---
 

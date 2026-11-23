@@ -13,6 +13,8 @@ npm-debug.log*
 
 # 运行时数据（数据库 / 密钥 / 日志）
 /data/
+/secret.key
+/backend/.run/
 *.db
 *.db-wal
 *.db-shm
