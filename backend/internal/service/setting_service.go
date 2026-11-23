@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
+	"github.com/tmp-platform/backend/internal/collector"
 	"github.com/tmp-platform/backend/internal/config"
 	"github.com/tmp-platform/backend/internal/inspect"
 	"github.com/tmp-platform/backend/internal/pkg/apperr"
@@ -13,10 +15,12 @@ import (
 
 // CollectionSettings 采集与平台参数配置（GET/PUT /settings/collection）。
 type CollectionSettings struct {
-	IntervalSec        int     `json:"intervalSec"`
-	TimeoutSec         int     `json:"timeoutSec"`
-	Concurrency        int     `json:"concurrency"`
-	Retry              int     `json:"retry"`
+	IntervalSec int `json:"intervalSec"`
+	TimeoutSec  int `json:"timeoutSec"`
+	Concurrency int `json:"concurrency"`
+	Retry       int `json:"retry"`
+	// SSHTimeoutSec 单条远端 SSH 命令（如 tiup cluster display）的执行上限。
+	SSHTimeoutSec      int     `json:"sshTimeoutSec"`
 	JWTTokenTTLHours   int     `json:"jwtTtlHours"`
 	IdleTimeoutMin     int     `json:"idleTimeoutMin"`
 	RetentionJobsDays  int     `json:"retentionJobsDays"`
@@ -58,6 +62,7 @@ func (s *SettingService) GetCollection(ctx context.Context) (*CollectionSettings
 		TimeoutSec:         atoiDefault(get(repo.SettingCollectTimeoutSec), 10),
 		Concurrency:        atoiDefault(get(repo.SettingCollectConcurrency), 4),
 		Retry:              atoiDefault(get(repo.SettingCollectRetry), 1),
+		SSHTimeoutSec:      atoiDefault(get(repo.SettingSSHTimeoutSec), int(collector.DefaultSSHCommandTimeout/time.Second)),
 		JWTTokenTTLHours:   atoiDefault(get(repo.SettingJWTTokenTTLHours), 8),
 		IdleTimeoutMin:     atoiDefault(get(repo.SettingAuthIdleTimeoutMin), 30),
 		RetentionJobsDays:  atoiDefault(get(repo.SettingRetentionJobsDays), 30),
@@ -85,6 +90,10 @@ func (s *SettingService) UpdateCollection(ctx context.Context, in CollectionSett
 	if in.Retry < 0 || in.Retry > 5 {
 		return nil, apperr.BadRequest("失败重试次数需在 0~5 之间")
 	}
+	if in.SSHTimeoutSec < collector.MinSSHCommandTimeoutSec || in.SSHTimeoutSec > collector.MaxSSHCommandTimeoutSec {
+		return nil, apperr.BadRequest(fmt.Sprintf("SSH 命令超时需在 %d~%d 秒之间",
+			collector.MinSSHCommandTimeoutSec, collector.MaxSSHCommandTimeoutSec))
+	}
 	if in.ThresholdCPUPct <= 0 || in.ThresholdCPUPct > 100 {
 		return nil, apperr.BadRequest("CPU 阈值需在 0~100 之间")
 	}
@@ -99,6 +108,7 @@ func (s *SettingService) UpdateCollection(ctx context.Context, in CollectionSett
 		repo.SettingCollectTimeoutSec:  strconv.Itoa(in.TimeoutSec),
 		repo.SettingCollectConcurrency: strconv.Itoa(in.Concurrency),
 		repo.SettingCollectRetry:       strconv.Itoa(in.Retry),
+		repo.SettingSSHTimeoutSec:      strconv.Itoa(in.SSHTimeoutSec),
 		repo.SettingJWTTokenTTLHours:   strconv.Itoa(in.JWTTokenTTLHours),
 		repo.SettingAuthIdleTimeoutMin: strconv.Itoa(in.IdleTimeoutMin),
 		repo.SettingRetentionJobsDays:  strconv.Itoa(in.RetentionJobsDays),
@@ -109,6 +119,10 @@ func (s *SettingService) UpdateCollection(ctx context.Context, in CollectionSett
 	}
 	if err := s.repo.SetMany(ctx, kv, by); err != nil {
 		return nil, apperr.Internal("保存配置失败")
+	}
+	// 立即生效：真实采集器持有同一份 CommandTimeouts，下次采集即用新上限。
+	if s.mode != nil {
+		s.mode.Timeouts().SetSSHCommand(time.Duration(in.SSHTimeoutSec) * time.Second)
 	}
 	return s.GetCollection(ctx)
 }

@@ -185,7 +185,8 @@ const sourceLabel = computed(() => {
     case 'display_text':
       return 'tiup cluster display（文本）'
     case 'meta_yaml':
-      return 'meta.yaml'
+      // 历史数据：旧版本曾降级读 meta.yaml，现已不再产生
+      return 'meta.yaml（历史）'
     default:
       return '—'
   }

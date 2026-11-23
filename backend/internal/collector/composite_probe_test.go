@@ -10,7 +10,7 @@ import (
 // 只请求 MySQL 时必须只返回 1 条 mysql 结果，不能返回 SSH/PD 的占位项。
 // 回归背景：接管任务按下标取第一个结果做判定，占位项会让「数据库连通性检查」必然失败。
 func TestCompositeProbe_OnlyRequestedScopes(t *testing.T) {
-	c := NewCompositeCollector(2 * time.Second)
+	c := NewCompositeCollector(NewCommandTimeouts(2 * time.Second))
 	// 指向一个必定拒绝连接的地址，保证快速失败（不需要真实集群）。
 	target := &Target{
 		ClusterName: "scope-test",

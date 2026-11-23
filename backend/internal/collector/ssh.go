@@ -3,51 +3,59 @@ package collector
 import (
 	"context"
 	"fmt"
-	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/tmp-platform/backend/internal/pkg/sshcmd"
 )
 
-// cmdRunner 统一抽象 SSH 远端与本机命令执行（TiUP 与平台同机时走本地）。
+// cmdRunner 远端命令执行抽象。
+//
+// 生产路径只有 SSH 一种实现；单测里注入本地执行器，
+// 免去「跑单测还得起一个 sshd」的麻烦。
 type cmdRunner interface {
-	RunTemplate(template string, args ...string) (string, error)
-	Run(cmd string) (string, error)
+	RunTemplate(ctx context.Context, template string, args ...string) (string, error)
 	Close() error
 }
 
-// sshChannel 真实 SSH 通道：读取 TiUP meta.yaml 与主机资源。
+// sshChannel 真实 SSH 通道：SSH 到 TiUP 中控机执行 `tiup cluster display`
+// 并采集该中控机自身的主机资源。
+//
+// 平台一律以「SSH 远程到 TiUP 机器」的方式采集：不存在本机直读分支，
+// 即使用户填 127.0.0.1，也要求该机器开启 sshd 并按 SSH 处理。
 type sshChannel struct {
-	timeout time.Duration
+	timeouts *CommandTimeouts
+	// dialer 可注入（单测用）；为 nil 时走真实 SSH。
+	dialer func(*Target) (cmdRunner, error)
 }
 
 // NewSSHChannel 构造 SSH 通道。
-func NewSSHChannel(timeout time.Duration) SSHChannel {
-	if timeout <= 0 {
-		timeout = ChannelTimeout
-	}
-	return &sshChannel{timeout: timeout}
+func NewSSHChannel(timeouts *CommandTimeouts) SSHChannel {
+	return &sshChannel{timeouts: timeouts}
 }
 
 // Kind 实现 Channel。
 func (s *sshChannel) Kind() Kind { return KindSSH }
 
-// dial 建立到 TiUP 主机的命令通道：本机地址直接本地执行，其余走 SSH。
+// dial 建立到 TiUP 中控机的 SSH 命令通道。
 func (s *sshChannel) dial(t *Target) (cmdRunner, error) {
-	if sshcmd.IsLocalHost(t.TiUPHost) {
-		return sshcmd.NewLocalRunner(5 * time.Second), nil
+	if s.dialer != nil {
+		return s.dialer(t)
+	}
+	// 组装目标为空时给出明确提示，避免 sshcmd 只报「缺少主机或用户名」。
+	if strings.TrimSpace(t.TiUPHost) == "" || strings.TrimSpace(t.TiUPUser) == "" {
+		return nil, fmt.Errorf("SSH 登录信息不完整（TiUP 地址=%q，SSH 用户=%q）", t.TiUPHost, t.TiUPUser)
 	}
 	return sshcmd.Dial(sshcmd.DialOptions{
-		Host:       t.TiUPHost,
-		Port:       t.TiUPPort,
-		User:       t.TiUPUser,
-		Password:   t.TiUPPassword,
-		PrivateKey: t.TiUPKey,
-		Timeout:    5 * time.Second,
+		Host:           t.TiUPHost,
+		Port:           t.TiUPPort,
+		User:           t.TiUPUser,
+		Password:       t.TiUPPassword,
+		PrivateKey:     t.TiUPKey,
+		Timeout:        SSHConnectTimeout,
+		CommandTimeout: s.timeouts.SSHCommand(),
 	})
 }
 
@@ -55,7 +63,6 @@ func (s *sshChannel) dial(t *Target) (cmdRunner, error) {
 func (s *sshChannel) Probe(ctx context.Context, t *Target) (ProbeResult, error) {
 	start := time.Now()
 	res := ProbeResult{Scope: ScopeSSH}
-	local := sshcmd.IsLocalHost(t.TiUPHost)
 	r, err := s.dial(t)
 	if err != nil {
 		res.Message = "SSH 连接失败: " + err.Error()
@@ -64,7 +71,7 @@ func (s *sshChannel) Probe(ctx context.Context, t *Target) (ProbeResult, error) 
 	}
 	defer func() { _ = r.Close() }()
 
-	out, err := r.RunTemplate("arch")
+	out, err := r.RunTemplate(ctx, "arch")
 	res.LatencyMS = time.Since(start).Milliseconds()
 	if err != nil {
 		res.Message = "SSH 登录成功但执行命令失败: " + err.Error()
@@ -72,47 +79,71 @@ func (s *sshChannel) Probe(ctx context.Context, t *Target) (ProbeResult, error) 
 	}
 	arch := NormalizeArch(strings.TrimSpace(out))
 	res.OK = true
-	if local {
-		res.Message = "本地模式：TiUP 与平台同机，已直读元数据"
-		res.Detail = map[string]any{"arch": arch, "local": true}
-	} else {
-		res.Message = "SSH 连接成功"
-		res.Detail = map[string]any{"arch": arch, "user": t.TiUPUser}
-	}
+	res.Message = "SSH 连接成功"
+	res.Detail = map[string]any{"arch": arch, "user": t.TiUPUser}
 	return res, nil
 }
 
-// metaPath 计算 meta.yaml 路径。
+// tiupBinRe 限定解析出的 tiup 可执行文件路径形态。
 //
-// 路径由「TiUP 部署目录 + 集群名」拼成，两段都经过 sshcmd 的字符白名单校验，
-// 不接受任何外部任意输入。本机模式下默认取当前用户 home（macOS 为 /Users/<user>）。
-func metaPath(t *Target) string {
-	base := strings.TrimSpace(t.TiUPDir)
-	if base == "" {
-		if sshcmd.IsLocalHost(t.TiUPHost) {
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				base = home + "/.tiup"
+// 探测结果来自远端命令输出，必须约束成绝对路径再拼进后续命令；
+// 不匹配时一律回落到裸 `tiup`，让原始报错（command not found）暴露出来。
+var tiupBinRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
+
+// resolveTiUPBin 定位 TiUP 可执行文件的绝对路径。
+//
+// 采集是「SSH 到中控机执行 tiup cluster display」，而 SSH 非交互会话不读
+// ~/.bashrc —— 官方安装脚本写进 PATH 的 ~/.tiup/bin 通常不可见，于是命令
+// 报 command not found、采集被误判为不可用。这里按以下顺序探测：
+//
+//  1. 远端 PATH（command -v tiup）；
+//  2. 安装脚本默认位置 $HOME/.tiup/bin/tiup；
+//  3. 用户显式配置的「TiUP 部署目录」<tiup_dir>/bin/tiup。
+//
+// 全部失败返回 ("tiup", false)，由调用方把「未找到 tiup」写进错误原因。
+func resolveTiUPBin(ctx context.Context, r cmdRunner, t *Target) (string, bool) {
+	if out, err := r.RunTemplate(ctx, "tiup_probe"); err == nil {
+		if p := lastLine(out); tiupBinRe.MatchString(p) {
+			return p, true
+		}
+	}
+	if dir := strings.TrimSpace(t.TiUPDir); dir != "" {
+		cand := strings.TrimSuffix(dir, "/") + "/bin/tiup"
+		if tiupBinRe.MatchString(cand) {
+			// 只做存在性校验（ls -d），再交给后续命令以绝对路径执行。
+			if _, lerr := r.RunTemplate(ctx, "tiup_dir", cand); lerr == nil {
+				return cand, true
 			}
 		}
 	}
-	if base == "" {
-		if t.TiUPUser == "root" {
-			base = "/root/.tiup"
-		} else {
-			base = "/home/" + t.TiUPUser + "/.tiup"
-		}
-	}
-	base = strings.TrimSuffix(base, "/")
-	return base + "/storage/cluster/clusters/" + t.ClusterName + "/meta.yaml"
+	return "tiup", false
 }
 
-// FetchTiUPMeta 按三级顺序采集 TiUP 集群元数据：
+// lastLine 取输出的最后一个非空行。
 //
+// tiup_probe 的 `command -v` 成功时只输出一行；失败时由 `ls` 补位，
+// 取最后一行可同时覆盖两种输出形态。
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// FetchTiUPMeta 采集 TiUP 集群元数据。
+//
+// 实例运行状态只认 `tiup cluster display` 的输出，不读 meta.yaml、也不拿
+// PD / MySQL 的状态去补：一旦 display 不可用，就直接返回「实例信息获取失败」，
+// 避免把「默认 up」「PD store 状态」混进同一份快照里冒充实测结果。
+//
+// 取值顺序：
 //  1. `tiup cluster display <name> --format=json`（首选：结构稳定、含头部信息）；
-//  2. meta.yaml（次选：display 不可用时的原始拓扑）；
-//  3. `tiup cluster display <name>` 文本输出（末选：头部 + 实例表格）。
+//  2. `tiup cluster display <name>` 文本输出（次选：非 TTY 下 TiUP 输出表格）。
 //
-// 三级全失败时返回聚合错误，逐级原因拼进 message 便于排错。
+// 两级全失败时聚合原因返回，逐级原因拼进 message 便于排错。
 func (s *sshChannel) FetchTiUPMeta(ctx context.Context, t *Target) (*TiUPMeta, error) {
 	r, err := s.dial(t)
 	if err != nil {
@@ -125,34 +156,32 @@ func (s *sshChannel) FetchTiUPMeta(ctx context.Context, t *Target) (*TiUPMeta, e
 	}
 
 	var reasons []string
+	bin, found := resolveTiUPBin(ctx, r, t)
+	if !found {
+		reasons = append(reasons,
+			"未定位到 tiup 可执行文件（PATH、$HOME/.tiup/bin/tiup、<TiUP 部署目录>/bin/tiup 均不可用）")
+	}
 
 	// 第 1 级：display JSON。
-	if meta, why := fetchMetaFromDisplayJSON(r, t); meta != nil {
+	if meta, why := fetchMetaFromDisplayJSON(ctx, r, bin, t); meta != nil {
 		return meta, nil
 	} else if why != "" {
 		reasons = append(reasons, why)
 	}
 
-	// 第 2 级：meta.yaml。
-	if meta, why := fetchMetaFromYAML(r, t); meta != nil {
+	// 第 2 级：display 文本输出。
+	if meta, why := fetchMetaFromDisplayText(ctx, r, bin, t); meta != nil {
 		return meta, nil
 	} else if why != "" {
 		reasons = append(reasons, why)
 	}
 
-	// 第 3 级：display 文本输出。
-	if meta, why := fetchMetaFromDisplayText(r, t); meta != nil {
-		return meta, nil
-	} else if why != "" {
-		reasons = append(reasons, why)
-	}
-
-	return nil, fmt.Errorf("采集 TiUP 元数据失败: %s", strings.Join(reasons, "; "))
+	return nil, fmt.Errorf("实例信息获取失败：tiup cluster display 不可用（%s）", strings.Join(reasons, "; "))
 }
 
 // fetchMetaFromDisplayJSON 第 1 级：解析 `tiup cluster display --format=json`。
-func fetchMetaFromDisplayJSON(r cmdRunner, t *Target) (*TiUPMeta, string) {
-	out, err := r.RunTemplate("tiup_display_json", t.ClusterName)
+func fetchMetaFromDisplayJSON(ctx context.Context, r cmdRunner, bin string, t *Target) (*TiUPMeta, string) {
+	out, err := r.RunTemplate(ctx, "tiup_display_json", bin, t.ClusterName)
 	if err != nil {
 		return nil, "tiup cluster display --format=json 执行失败: " + err.Error()
 	}
@@ -168,26 +197,9 @@ func fetchMetaFromDisplayJSON(r cmdRunner, t *Target) (*TiUPMeta, string) {
 	return meta, ""
 }
 
-// fetchMetaFromYAML 第 2 级：读取并解析 TiUP 存储目录下的 meta.yaml。
-func fetchMetaFromYAML(r cmdRunner, t *Target) (*TiUPMeta, string) {
-	content, err := r.RunTemplate("cat", metaPath(t))
-	if err != nil {
-		return nil, "读取 meta.yaml 失败: " + err.Error()
-	}
-	var meta TiUPMeta
-	if err := yaml.Unmarshal([]byte(content), &meta); err != nil {
-		return nil, "解析 meta.yaml 失败: " + err.Error()
-	}
-	if meta.ClusterVersion == "" && meta.Version == "" && meta.TiDBVersion == "" && !metaHasServers(&meta) {
-		return nil, "meta.yaml 内容为空（无版本信息与实例定义）"
-	}
-	meta.Source = MetaSourceYAML
-	return &meta, ""
-}
-
-// fetchMetaFromDisplayText 第 3 级：解析 `tiup cluster display` 的文本输出（头部 + 实例表格）。
-func fetchMetaFromDisplayText(r cmdRunner, t *Target) (*TiUPMeta, string) {
-	out, err := r.RunTemplate("tiup_display", t.ClusterName)
+// fetchMetaFromDisplayText 第 2 级：解析 `tiup cluster display` 的文本输出（头部 + 实例表格）。
+func fetchMetaFromDisplayText(ctx context.Context, r cmdRunner, bin string, t *Target) (*TiUPMeta, string) {
+	out, err := r.RunTemplate(ctx, "tiup_display", bin, t.ClusterName)
 	if err != nil {
 		return nil, "tiup cluster display 文本执行失败: " + err.Error()
 	}
@@ -222,34 +234,34 @@ func (s *sshChannel) FetchHostResource(ctx context.Context, t *Target) ([]HostRe
 	}
 
 	h := HostResource{IP: t.TiUPHost, OSUser: t.TiUPUser}
-	if out, err := r.RunTemplate("arch"); err == nil {
+	if out, err := r.RunTemplate(ctx, "arch"); err == nil {
 		h.Arch = NormalizeArch(strings.TrimSpace(out))
 	}
-	if out, err := r.RunTemplate("hostname"); err == nil {
+	if out, err := r.RunTemplate(ctx, "hostname"); err == nil {
 		h.Hostname = strings.TrimSpace(out)
 	}
-	if out, err := r.RunTemplate("nproc"); err == nil {
+	if out, err := r.RunTemplate(ctx, "nproc"); err == nil {
 		h.CPUCores, _ = strconv.Atoi(strings.TrimSpace(out))
 	}
-	if out, err := r.RunTemplate("free"); err == nil {
+	if out, err := r.RunTemplate(ctx, "free"); err == nil {
 		h.MemoryGB, h.MemUsagePct = parseFreeM(out)
 	}
-	if out, err := r.RunTemplate("df"); err == nil {
+	if out, err := r.RunTemplate(ctx, "df"); err == nil {
 		h.DiskTotalGB, h.DiskUsagePct = parseDfPM(out)
 	}
-	h.CPUUsagePct = s.cpuUsage(r)
+	h.CPUUsagePct = cpuUsage(ctx, r)
 	return []HostResource{h}, nil
 }
 
 // cpuUsage 通过两次读取 /proc/stat 计算瞬时 CPU 使用率。
-func (s *sshChannel) cpuUsage(r cmdRunner) float64 {
-	first, err := r.RunTemplate("cat", "/proc/stat")
+func cpuUsage(ctx context.Context, r cmdRunner) float64 {
+	first, err := r.RunTemplate(ctx, "cat", "/proc/stat")
 	if err != nil {
 		return 0
 	}
 	idle1, total1 := parseProcStat(first)
 	time.Sleep(200 * time.Millisecond)
-	second, err := r.RunTemplate("cat", "/proc/stat")
+	second, err := r.RunTemplate(ctx, "cat", "/proc/stat")
 	if err != nil {
 		return 0
 	}

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Normalized meta.yaml 归一化结果。
+// Normalized TiUP display 解析结果的归一化产物。
 type Normalized struct {
 	Instances        []InstanceSnapshot
 	DashboardURLs    []string
@@ -23,7 +23,7 @@ type Normalized struct {
 
 // NormalizeVersion 统一版本号展示形式（补齐 v 前缀），如 8.5.5 → v8.5.5。
 //
-// PD stores 返回的版本通常不带 v，meta.yaml 与 SELECT VERSION() 带 v，
+// PD stores 返回的版本通常不带 v，display 与 SELECT VERSION() 带 v，
 // 统一后避免同一集群里出现两种写法。
 func NormalizeVersion(raw string) string {
 	v := strings.TrimSpace(raw)
@@ -97,7 +97,7 @@ func ParsePDEndpoint(raw string) (host string, port int) {
 	return host, port
 }
 
-// normalizeServers 把 meta.yaml 的 server 段转换为实例快照。
+// normalizeServers 把 TiUP display 解析出的 server 段转换为实例快照。
 func normalizeServers(servers []MetaServer, component string, defaultPort, defaultStatusPort int, version string) []InstanceSnapshot {
 	out := make([]InstanceSnapshot, 0, len(servers))
 	for i, s := range servers {
@@ -123,9 +123,9 @@ func normalizeServers(servers []MetaServer, component string, defaultPort, defau
 		if component == "tikv" || component == "tidb" {
 			role = "service"
 		}
-		// 状态默认 up：meta.yaml 不含状态信息，保持历史行为；
-		// 仅当 display 解析出了状态（MetaServer.Status 非空）才覆盖。
-		status := "up"
+		// 状态只来自 `tiup cluster display` 的状态列；display 未给出时记 unknown，
+		// 绝不默认成 up —— 否则「采不到状态」会被界面读成「一切正常」。
+		status := "unknown"
 		if s.Status != "" {
 			status = s.Status
 		}
@@ -145,7 +145,7 @@ func normalizeServers(servers []MetaServer, component string, defaultPort, defau
 	return out
 }
 
-// NormalizeMeta 按 ARCHITECTURE §6.3 把 meta.yaml 映射为 Snapshot 字段。
+// NormalizeMeta 按 ARCHITECTURE §6.3 把 TiUP display 结果映射为 Snapshot 字段。
 func NormalizeMeta(meta *TiUPMeta, clusterName string) *Normalized {
 	n := &Normalized{}
 	if meta == nil {
@@ -174,7 +174,7 @@ func NormalizeMeta(meta *TiUPMeta, clusterName string) *Normalized {
 
 	// 外部系统地址（按实际端口拼装，去重后返回）。
 	// Grafana / Dashboard 优先采用 `tiup cluster display` 显式给出的地址，
-	// 未提供时才按 server 列表与端口推导（meta.yaml 路径即走推导分支）。
+	// 未提供时才按 server 列表与端口推导。
 	if len(meta.GrafanaURLs) > 0 {
 		n.GrafanaURLs = dedupeStrings(meta.GrafanaURLs)
 	} else {
@@ -234,7 +234,7 @@ func firstPositive(vals ...int) int {
 
 // archOfServers 从各 server 的 arch 字段推断集群架构。
 //
-// 真实 TiUP meta.yaml 的 global 段通常没有 arch，架构写在每个 server 上（如 arm64）。
+// TiUP 拓扑的 arch 通常写在每个 server 上（如 arm64），global 段常常为空。
 func archOfServers(m *TiUPMeta) string {
 	groups := [][]MetaServer{
 		m.PdServers, m.TidbServers, m.TiproxyServers, m.TikvServers,
@@ -251,7 +251,7 @@ func archOfServers(m *TiUPMeta) string {
 	return ""
 }
 
-// withPDClientPort 返回 PD server 副本：真实 meta.yaml 里 PD 用 client_port/peer_port，没有 port。
+// withPDClientPort 返回 PD server 副本：PD 的端口来自 client_port，Port 为空时用它补齐。
 func withPDClientPort(in []MetaServer) []MetaServer {
 	out := make([]MetaServer, len(in))
 	copy(out, in)
@@ -386,7 +386,11 @@ func normalizeInstanceStatus(raw string) string {
 	}
 }
 
-// MergeInstances 用 PD stores 结果校准 TiKV 实例状态与标签（AZ）。
+// MergeInstances 用 PD stores 补齐 TiKV 实例的 AZ 与空版本。
+//
+// 只补齐「静态属性」，绝不改写 Status：实例运行状态唯一来源是
+// `tiup cluster display`，PD 的 store 状态不能混进来（两者口径不同，
+// 混用会出现「display 说 Up、界面显示 Down」的自相矛盾）。
 func MergeInstances(base []InstanceSnapshot, stores []Store) []InstanceSnapshot {
 	if len(stores) == 0 {
 		return base
@@ -402,8 +406,7 @@ func MergeInstances(base []InstanceSnapshot, stores []Store) []InstanceSnapshot 
 		}
 		key := base[i].HostIP + "|" + strconv.Itoa(base[i].Port)
 		if s, ok := byAddr[key]; ok {
-			base[i].Status = normalizeInstanceStatus(s.StateName)
-			if s.Version != "" {
+			if base[i].Version == "" && s.Version != "" {
 				base[i].Version = NormalizeVersion(s.Version)
 			}
 			if base[i].AZ == "" {

@@ -65,12 +65,15 @@ func TestE2E_CollectFromRealTiUP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// 平台一律 SSH 到 TiUP 中控机取数（无本地直读），因此本用例要求
+	// 本机 sshd 可登录、且 TMP_E2E_TIUP_USER 是该集群的 TiUP 属主用户；
+	// 不满足时下面的 ChanErrors 分支会 Skip 而不是 FAIL。
 	target := &Target{
 		ClusterName: cluster,
 		TiUPHost:    "localhost",
 		TiUPUser:    os.Getenv("TMP_E2E_TIUP_USER"),
 	}
-	col := NewCompositeCollector(ChannelTimeout)
+	col := NewCompositeCollector(NewCommandTimeouts(ChannelTimeout))
 	snap, err := col.Collect(ctx, target, FullScope())
 	if err != nil {
 		t.Skipf("Collect 整体失败（环境不可用）: %v", err)

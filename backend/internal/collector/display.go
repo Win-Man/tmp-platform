@@ -16,8 +16,6 @@ const (
 	// DisplaySourceText 来源为 `tiup cluster display <name>` 的文本输出
 	// （非 TTY 环境下 TiUP 直接输出文本表格）。
 	DisplaySourceText = "display_text"
-	// MetaSourceYAML 来源为 TiUP 存储目录下的 meta.yaml。
-	MetaSourceYAML = "meta_yaml"
 )
 
 // 端口与 URL 分隔符。
@@ -380,13 +378,13 @@ func (d *TiUPDisplay) ToMeta() *TiUPMeta {
 			DataDir:    cleanDash(inst.DataDir),
 			Arch:       arch,
 		}
-		// display 给出实例级状态，归一后写进 MetaServer.Status，
-		// 由 normalizeServers 透传到 InstanceSnapshot（meta.yaml 路径无此信息则保持默认 up）。
+		// display 是实例状态的唯一来源：状态列归一后写进 MetaServer.Status，
+		// 由 normalizeServers 透传到 InstanceSnapshot，全程不接受其它通道改写。
 		status, leader := displayInstanceStatus(inst.Status)
 		srv.Status = status
 		switch canonicalComponent(firstNonEmpty(inst.ComponentName, inst.Role)) {
 		case "pd":
-			// 真实 meta.yaml 用 client_port/peer_port 表达 PD 端口，这里直接填好，withPDClientPort 会兜底。
+			// PD 的客户端端口落在 ClientPort（display 的 ports 首段），withPDClientPort 会据此补 Port。
 			srv.ClientPort = primary
 			srv.PeerPort = secondary
 			if leader {

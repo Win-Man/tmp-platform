@@ -91,7 +91,7 @@ export interface ClusterBrief {
   lastSuccessAt?: string | null
   fetchedAt?: string | null
   lastCollectError?: string
-  /** 最近一次采集的元数据来源：display_json / display_text / meta_yaml。 */
+  /** 最近一次采集的元数据来源：display_json / display_text（历史数据可能为 meta_yaml）。 */
   collectSource?: string
   /** 交叉校验告警：TiUP 报告的实例状态与平台实测连通性矛盾时逐条记录。 */
   collectWarnings?: string[]
@@ -462,6 +462,8 @@ export interface CollectionSettings {
   timeoutSec: number
   concurrency: number
   retry: number
+  /** 单条远端 SSH 命令（如 tiup cluster display）的执行上限，5~300 秒。 */
+  sshTimeoutSec: number
   jwtTtlHours: number
   idleTimeoutMin: number
   retentionJobsDays: number

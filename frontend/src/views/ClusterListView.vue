@@ -194,6 +194,9 @@
           <el-col :span="16">
             <el-form-item label="TiUP 主机" prop="tiupHost">
               <el-input v-model="form.tiupHost" placeholder="10.0.0.11" />
+              <span class="text-muted form-hint">
+                平台经 SSH 到该机器执行 tiup cluster display；即使与平台同机也需开启 sshd，且 SSH 用户须是该集群的 TiUP 属主用户
+              </span>
             </el-form-item>
           </el-col>
           <el-col :span="8">

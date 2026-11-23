@@ -147,7 +147,8 @@ func (e *Engine) handleTakeover(ctx context.Context, r *Runner) error {
 			return fmt.Errorf("读取集群拓扑失败: %w", cerr)
 		}
 		snap = s
-		r.Logf(5000, "读取到 %d 个实例、%d 台主机、%d 个账号", len(s.Instances), len(s.Hosts), len(s.Users))
+		r.Logf(5000, "元数据来源 %s，读取到 %d 个实例、%d 台主机、%d 个账号",
+			describeMetaSource(s.Source), len(s.Instances), len(s.Hosts), len(s.Users))
 		for k, v := range s.ChanErrors {
 			r.Log(5000, "warn", "通道 %s 采集失败：%s", k, v)
 		}
@@ -200,10 +201,8 @@ func describeMetaSource(source string) string {
 		return "tiup cluster display --format=json"
 	case collector.DisplaySourceText:
 		return "tiup cluster display 文本输出"
-	case collector.MetaSourceYAML:
-		return "meta.yaml（降级）"
 	default:
-		return "未知来源"
+		return "未知来源（实例信息获取失败）"
 	}
 }
 
@@ -261,10 +260,6 @@ func (e *Engine) handleCollect(ctx context.Context, r *Runner) error {
 			describeMetaSource(s.Source), len(s.Instances), len(s.Hosts))
 		if msg, bad := s.ChanErrors[collector.KindSSH]; bad {
 			r.Log(2000, "warn", "SSH 通道失败：%s", msg)
-		} else if s.Source == collector.MetaSourceYAML {
-			// meta.yaml 不含实例运行状态，全部按默认 up 填写 —— 必须显式告警，
-			// 否则界面上「全绿」会被误读为集群确实健康。
-			r.Log(2000, "warn", "已降级读取 meta.yaml（tiup cluster display 不可用）：meta.yaml 不含实例运行状态，本次实例状态为默认值 up，不能作为故障判断依据")
 		}
 		for _, msg := range s.Consistency {
 			r.Log(2000, "warn", "状态交叉校验：%s", msg)
@@ -511,13 +506,15 @@ func (e *Engine) probeHostSSH(ctx context.Context, h *model.Host) error {
 		User:       user,
 		Password:   target.TiUPPassword,
 		PrivateKey: target.TiUPKey,
-		Timeout:    5 * time.Second,
+		Timeout:    sshcmd.DefaultConnectTimeout,
+		// 主机探活只跑 uname -m：给 10s 上限，避免逐台探测时单台卡满 30s。
+		CommandTimeout: 10 * time.Second,
 	})
 	if derr != nil {
 		return derr
 	}
 	defer func() { _ = runner.Close() }()
-	_, rerr := runner.RunTemplate("arch")
+	_, rerr := runner.RunTemplate(ctx, "arch")
 	return rerr
 }
 

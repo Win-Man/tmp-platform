@@ -25,8 +25,8 @@ LimitNOFILE=65535
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-# 只读保护家目录：接管「同机 TiUP 集群」时需要读 ~/.tiup 元数据，
-# 这里用 read-only 而非 tmpfs，保证可读、不可改。
+# 只读保护家目录：采集不再本地读 ~/.tiup（一律 SSH 到中控机执行），
+# 但备份/排错时常需查看家目录，这里保留 read-only（可读、不可改）。
 ProtectHome=read-only
 # 唯一可写目录
 ReadWritePaths=__TMP_PREFIX__/data

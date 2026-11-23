@@ -20,6 +20,10 @@
             <el-form-item label="失败重试次数">
               <el-input-number v-model="collection.retry" :min="0" :max="5" :disabled="readonly" />
             </el-form-item>
+            <el-form-item label="SSH 命令超时（秒）">
+              <el-input-number v-model="collection.sshTimeoutSec" :min="5" :max="300" :disabled="readonly" />
+              <span class="text-muted hint">单条远端命令上限（如 tiup cluster display），5 ~ 300</span>
+            </el-form-item>
             <el-form-item label="异常判定阈值">
               <el-input-number v-model="collection.clusterErrorStreak" :min="1" :max="20" :disabled="readonly" />
               <span class="text-muted hint">连续失败 N 次后标记为异常</span>
@@ -210,6 +214,7 @@ const collection = ref<CollectionSettings>({
   timeoutSec: 10,
   concurrency: 4,
   retry: 1,
+  sshTimeoutSec: 30,
   jwtTtlHours: 8,
   idleTimeoutMin: 30,
   retentionJobsDays: 30,

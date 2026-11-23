@@ -13,17 +13,25 @@ import (
 
 // CompositeCollector 真实模式采集器：聚合 SSH / MySQL / PD 三通道，并行采集互不阻塞。
 type CompositeCollector struct {
-	ssh   SSHChannel
-	mysql MySQLChannel
-	pd    PDChannel
+	ssh      SSHChannel
+	mysql    MySQLChannel
+	pd       PDChannel
+	timeouts *CommandTimeouts
 }
 
 // NewCompositeCollector 构造真实模式采集器。
-func NewCompositeCollector(timeout time.Duration) *CompositeCollector {
+//
+// SSH 的单命令超时由 timeouts 提供（系统设置可调，默认 30s）；
+// MySQL / PD 仍用固定的 ChannelTimeout。
+func NewCompositeCollector(timeouts *CommandTimeouts) *CompositeCollector {
+	if timeouts == nil {
+		timeouts = NewCommandTimeouts(0)
+	}
 	return &CompositeCollector{
-		ssh:   NewSSHChannel(timeout),
-		mysql: NewMySQLChannel(timeout),
-		pd:    NewPDChannel(timeout),
+		ssh:      NewSSHChannel(timeouts),
+		mysql:    NewMySQLChannel(ChannelTimeout),
+		pd:       NewPDChannel(ChannelTimeout),
+		timeouts: timeouts,
 	}
 }
 
@@ -114,7 +122,14 @@ func (c *CompositeCollector) Exec(ctx context.Context, t *Target, st Statement) 
 // 通道错误全部记入 Snapshot.ChanErrors，由 Derive 统一推导健康状态；
 // 采集过程绝不因单通道失败而整体返回 error（除非上下文被取消）。
 func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectScope) (*Snapshot, error) {
-	ctx, cancel := context.WithTimeout(ctx, TotalTimeout)
+	// 整体窗口取「SSH 通道窗口」与 TotalTimeout 的较大者：SSH 单命令上限
+	// 可配（默认 30s，比固定的 15s 长），不放大窗口会把大集群的正常
+	// display 卡在 TotalTimeout 上。
+	window := TotalTimeout
+	if w := c.timeouts.SSHWindow(); w > window {
+		window = w
+	}
+	ctx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 
 	snap := &Snapshot{
@@ -150,7 +165,7 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 	// 通道 1：SSH —— 拓扑与主机资源。
 	if sc.Meta {
 		g.Go(func() error {
-			cctx, ccancel := context.WithTimeout(ctx, ChannelTimeout)
+			cctx, ccancel := context.WithTimeout(ctx, c.timeouts.SSHWindow())
 			defer ccancel()
 			m, err := c.ssh.FetchTiUPMeta(cctx, t)
 			if err != nil {
@@ -163,7 +178,7 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 	}
 	if sc.Hosts {
 		g.Go(func() error {
-			cctx, ccancel := context.WithTimeout(ctx, ChannelTimeout)
+			cctx, ccancel := context.WithTimeout(ctx, c.timeouts.SSHWindow())
 			defer ccancel()
 			h, err := c.ssh.FetchHostResource(cctx, t)
 			if err == nil {
@@ -273,13 +288,11 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 		return nil, err
 	}
 
-	// 归一化：meta.yaml → 实例 / 地址 / 版本 / 架构。
+	// 归一化：display → 实例 / 地址 / 版本 / 架构。
+	// display 不可用时 meta 为 nil，实例为空 —— 上层据此显示「实例信息获取失败」，
+	// 不再用 meta.yaml 或 PD stores 拼一份降级拓扑。
 	normalized := NormalizeMeta(meta, t.ClusterName)
 	instances := MergeInstances(normalized.Instances, stores)
-	if len(instances) == 0 {
-		// meta 不可用时用 PD stores 反推 TiKV 实例，保证拓扑不完全空白。
-		instances = instancesFromStores(stores)
-	}
 
 	snap.Meta = meta
 	snap.Instances = instances
@@ -330,11 +343,10 @@ func (c *CompositeCollector) Collect(ctx context.Context, t *Target, sc CollectS
 //
 // `tiup cluster display` 的状态列是 TiUP 自己发起的「一次性探测」结果，
 // 会因瞬时超时把整排实例误报为 Down（曾在集群全程无重启时出现全 Down、
-// Dashboard URL 整行缺失的形态）；而 meta.yaml 兜底时根本没有状态字段、
-// 一律按 up 填写。两种情形都会让平台显示与真相不符。
+// Dashboard URL 整行缺失的形态）。这类误判只能靠旁证提示，不能靠改写状态解决。
 //
-// 因此这里只做一件事：发现矛盾时把话说明白，交给用户判断，
-// 绝不擅自改写 TiUP 给出的状态（那会掩盖真实故障）。
+// 注意：本函数只产出「告警文案」，绝不参与实例状态赋值 —— 状态唯一来源仍是
+// `tiup cluster display`。发现矛盾时把话说明白，交给用户判断。
 func crossCheckStatus(s *Snapshot) []string {
 	if s == nil || s.Normalized == nil || len(s.Instances) == 0 {
 		return nil
@@ -382,10 +394,10 @@ func crossCheckStatus(s *Snapshot) []string {
 			"PD 中存在 up 状态的 TiKV store，但 TiUP 报告全部 %d 个 tikv 实例状态非 up —— 两者矛盾",
 			tikvTotal))
 	}
-	// 4) 反向：拓扑一片正常，但 MySQL 根本连不上（meta.yaml 兜底时最常见）。
+	// 4) 反向：拓扑一片正常，但 MySQL 根本连不上 —— display 与实际连通性矛盾。
 	if !mysqlOK && tidbTotal > 0 && len(tidbDown) == 0 {
 		out = append(out, fmt.Sprintf(
-			"拓扑显示 %d 个 tidb 实例均正常，但 MySQL 通道连不上（%s）—— 若本次数据来自 meta.yaml，实例状态为默认值、不可作为正常依据",
+			"TiUP 显示 %d 个 tidb 实例均正常，但 MySQL 通道连不上（%s）—— 请复核实例状态与实际连通性",
 			tidbTotal, s.ChanErrors[KindMySQL]))
 	}
 	return out
@@ -399,29 +411,6 @@ func hasUpStore(stores []Store) bool {
 		}
 	}
 	return false
-}
-
-// instancesFromStores 用 PD stores 反推 TiKV 实例。
-func instancesFromStores(stores []Store) []InstanceSnapshot {
-	out := make([]InstanceSnapshot, 0, len(stores))
-	for _, s := range stores {
-		host, portStr := splitHostPort(s.Address)
-		port := 0
-		if portStr != "" {
-			port = atoi(portStr)
-		}
-		out = append(out, InstanceSnapshot{
-			Component:  "tikv",
-			HostIP:     host,
-			Port:       port,
-			StatusPort: port + 80,
-			Role:       "service",
-			Status:     normalizeInstanceStatus(s.StateName),
-			Version:    NormalizeVersion(s.Version),
-			AZ:         s.Labels["zone"],
-		})
-	}
-	return out
 }
 
 // synthesizeHosts 为仅有 IP 的实例补一条主机记录，保证主机数与拓扑一致。
@@ -454,18 +443,6 @@ func ensureClusterInfo(c *ClusterInfo) *ClusterInfo {
 		return &ClusterInfo{}
 	}
 	return c
-}
-
-// atoi 安全字符串转整型。
-func atoi(s string) int {
-	n := 0
-	for _, ch := range s {
-		if ch < '0' || ch > '9' {
-			return 0
-		}
-		n = n*10 + int(ch-'0')
-	}
-	return n
 }
 
 // MarshalCapabilities 序列化能力快照到 clusters.capabilities（JSON 字符串）。

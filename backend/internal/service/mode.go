@@ -5,7 +5,9 @@ package service
 
 import (
 	"context"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/tmp-platform/backend/internal/collector"
 	"github.com/tmp-platform/backend/internal/repo"
@@ -20,18 +22,26 @@ type ModeManager struct {
 	forcedMock bool
 	real       collector.Collector
 	mockC      collector.Collector
+	timeouts   *collector.CommandTimeouts
 }
 
 // NewModeManager 构造模式管理器。
 func NewModeManager(forcedMock bool) *ModeManager {
+	timeouts := collector.NewCommandTimeouts(collector.DefaultSSHCommandTimeout)
 	m := &ModeManager{
 		forcedMock: forcedMock,
 		mock:       forcedMock,
-		real:       collector.NewCompositeCollector(collector.ChannelTimeout),
+		timeouts:   timeouts,
+		real:       collector.NewCompositeCollector(timeouts),
 		mockC:      collector.NewMockCollector(),
 	}
 	return m
 }
+
+// Timeouts 返回采集超时配置。
+//
+// 系统设置保存后通过它热更新，真实采集器持有同一份指针，无需重建。
+func (m *ModeManager) Timeouts() *collector.CommandTimeouts { return m.timeouts }
 
 // Current 返回当前模式下的采集器。
 func (m *ModeManager) Current() collector.Collector {
@@ -64,8 +74,15 @@ func (m *ModeManager) SetMock(enabled bool) bool {
 	return true
 }
 
-// LoadFromSettings 启动时按 settings.mode.mock 初始化模式。
+// LoadFromSettings 启动时按 settings 初始化模式与采集超时。
 func (m *ModeManager) LoadFromSettings(ctx context.Context, settings *repo.SettingRepo) error {
+	// SSH 命令超时与模式无关，强制演示模式时也要加载（关闭演示后立即生效）。
+	if v, err := settings.Get(ctx, repo.SettingSSHTimeoutSec); err == nil {
+		if sec, cerr := strconv.Atoi(v); cerr == nil && sec > 0 {
+			m.timeouts.SetSSHCommand(time.Duration(sec) * time.Second)
+		}
+	}
+
 	if m.forcedMock {
 		return nil
 	}

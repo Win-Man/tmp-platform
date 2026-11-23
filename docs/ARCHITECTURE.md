@@ -61,7 +61,7 @@ graph TB
     end
     subgraph LC["采集适配层"]
       CI["Collector 接口<br/>Probe / Capabilities / Collect"]
-      CS["SSHCollector<br/>TiUP meta.yaml + 主机资源"]
+      CS["SSHCollector<br/>tiup cluster display + 主机资源"]
       CM["MySQLCollector<br/>go-sql-driver/mysql"]
       CP["PDCollector<br/>PD HTTP API"]
       CK["MockCollector<br/>3 套内置假集群"]
@@ -170,11 +170,11 @@ tmp-platform/
 │     ├─ collector/
 │     │  ├─ collector.go           # Collector/Channel 接口、Target、Snapshot、Capabilities
 │     │  ├─ composite.go           # 三通道 errgroup 并行聚合 + 降级判定
-│     │  ├─ ssh.go                 # SSH 通道：TiUP meta.yaml、主机资源、连通性
+│     │  ├─ ssh.go                 # SSH 通道：tiup cluster display、主机资源、连通性
 │     │  ├─ mysql.go               # MySQL 通道：版本/集群信息/用户/参数/会话/RG
 │     │  ├─ pd.go                  # PD 通道：stores/cluster status/members/replication_mode
 │     │  ├─ mock.go                # mock 通道：3 套内置假集群
-│     │  ├─ mapping.go             # meta.yaml → Snapshot 字段映射与归一化
+│     │  ├─ mapping.go             # display 解析结果 → Snapshot 字段映射与归一化
 │     │  └─ cap.go                 # 版本号解析 → Capabilities
 │     ├─ job/
 │     │  ├─ engine.go              # worker pool、队列、状态机、取消
@@ -277,7 +277,7 @@ CREATE TABLE clusters (
   last_collect_at   DATETIME,
   last_success_at   DATETIME,
   last_collect_error TEXT,
-  collect_source    TEXT,                                      -- display_json|display_text|meta_yaml（最近一次采集来源）
+  collect_source    TEXT,                                      -- display_json|display_text（最近一次采集来源）
   collect_warnings  TEXT,                                      -- JSON array：TiUP 报告状态与实测连通性的矛盾
   capabilities      TEXT,                                      -- JSON: Capabilities 快照
   fetched_at        DATETIME,                                  -- 数据截至（降级展示用）
@@ -620,7 +620,7 @@ CREATE TABLE settings (
 CREATE UNIQUE INDEX uk_settings_key ON settings(key);
 ```
 
-**settings 内置键**：`collect.interval_sec=300`、`collect.timeout_sec=10`、`collect.concurrency=4`、`collect.retry=1`、`auth.jwt_ttl_hours=8`、`auth.idle_timeout_min=30`、`mode.mock=false`、`retention.jobs_days=30`、`retention.audit_days=180`、`threshold.cpu_pct=80`、`threshold.disk_pct=85`、`cluster.error_streak=3`、`setup.completed=false`。
+**settings 内置键**：`collect.interval_sec=300`、`collect.timeout_sec=10`、`collect.concurrency=4`、`collect.retry=1`、`ssh.timeout_sec=30`（单条远端 SSH 命令上限）、`auth.jwt_ttl_hours=8`、`auth.idle_timeout_min=30`、`mode.mock=false`、`retention.jobs_days=30`、`retention.audit_days=180`、`threshold.cpu_pct=80`、`threshold.disk_pct=85`、`cluster.error_streak=3`、`setup.completed=false`。
 
 > **表数量：19 张**（你给定的 18 张 + `job_logs`：F-62 要求「>5000 行仍流畅滚动」，日志必须独立成表，否则 `job_steps` 行会膨胀）。
 
@@ -939,7 +939,7 @@ type PDChannel interface {
 }
 
 // PDDiscoverer 可选能力：自动发现 PD 地址（接管表单无需用户手填）。
-// 真实模式：SSH/本地读 meta.yaml 的 topology.pd_servers（client_port）→ tiup cluster display
+// 真实模式：SSH/本地执行 tiup cluster display，取 pd_servers（client_port）
 //          → MySQL 查 information_schema.cluster_info；
 // 演示模式：从内置数据集取 PD 实例。
 type PDDiscovery struct{ Endpoints []string; Source, Message string }
@@ -999,9 +999,9 @@ sequenceDiagram
   API-->>FE: 202 {jobId}
 
   JE->>JE: worker 领取 → status=running, progress=5
-  JE->>CC: Collect(ctx(timeout=15s), target, all)
+  JE->>CC: Collect(ctx(窗口 = max(15s, SSH 通道窗口)), target, all)
   par errgroup 三通道并行（互不阻塞）
-    CC->>SSH: ssh dial + read ~/.tiup/storage/cluster/clusters/{cluster}/meta.yaml
+    CC->>SSH: ssh dial + resolve tiup + tiup cluster display {cluster} --format=json
     SSH-->>CC: TiUPMeta 或 err
     CC->>SSH: 固定命令 uname -m / nproc / free / df（主机资源）
   and
@@ -1024,55 +1024,46 @@ sequenceDiagram
   API-->>FE: progress / currentStep
 ```
 
-### 6.3 TiUP 拓扑采集顺序与 meta.yaml → 数据表字段映射
+### 6.3 TiUP 拓扑采集顺序与 display → 数据表字段映射
 
-**采集顺序**（`ssh.go: FetchTiUPMeta`，三级，前一级成功即返回，全失败时把各级原因聚合上报）：
+**采集顺序**（`ssh.go: FetchTiUPMeta`，两级，前一级成功即返回，全失败时把各级原因聚合上报）：
 
 1. `tiup cluster display <name> --format=json`（**首选**，`Source=display_json`）：结构稳定，且直接给出 `cluster_version` / `dashboard_urls` / `grafana_urls`，无需自行从拓扑拼装；输出尾部可能跟一段 `{"exit_code":0}`（部分版本或 stderr 被合并时），因此解析用 `json.Decoder` 只取**第一个** JSON 值；
-2. `cat <tiup_dir>/storage/cluster/clusters/<name>/meta.yaml`（二级兜底，`Source=meta_yaml`）：display 不可用时读原始拓扑；
-3. `tiup cluster display <name>` 文本输出（三级兜底，`Source=display_text`）：解析头部键值行 + 空格对齐的实例表格。注意 `-T` 在 TiUP 1.17 上**不存在**（报 `unknown shorthand flag: 'T'`），非 TTY 环境下该命令本身就输出纯文本表格。
+2. `tiup cluster display <name>` 文本输出（次选，`Source=display_text`）：解析头部键值行 + 空格对齐的实例表格。注意 `-T` 在 TiUP 1.17 上**不存在**（报 `unknown shorthand flag: 'T'`），非 TTY 环境下该命令本身就输出纯文本表格。
 
-真实 TiUP（v1.9+）生成的 meta.yaml 与早期文档假设的结构有两处关键差异，实现时必须兼容：
+**不再读 meta.yaml**：实例运行状态（含 TiKV）只认 `tiup cluster display` 的输出，不读 meta.yaml、也不用 PD store 状态回填。display 两级全失败时 SSH 通道直接记「实例信息获取失败：tiup cluster display 不可用（原因…）」，界面显示失败而不是降级拓扑。
 
-1. server 列表嵌套在 **`topology:`** 段下，不是顶层键；
-2. 版本键是 **`tidb_version`**（顶层），PD 只有 `client_port` / `peer_port`，**没有** `port`；架构写在每个 server 上，`global.arch` 通常为空。
+**tiup 可执行文件定位**（`ssh.go: resolveTiUPBin`）：采集是「SSH 到中控机执行 display」，而 SSH 非交互会话不读 `~/.bashrc`，安装脚本写进 PATH 的 `~/.tiup/bin` 往往不可见（`ssh host 'tiup ...'` 报 command not found）。因此按以下顺序定位绝对路径并直接用绝对路径执行：① `command -v tiup`；② `$HOME/.tiup/bin/tiup`；③ `<TiUP 部署目录>/bin/tiup`。全部失败时错误信息明确写「未定位到 tiup 可执行文件」。
 
-`TiUPMeta.UnmarshalYAML` 同时解嵌套与扁平两种写法（先按扁平解，`topology` 段内列表非空时覆盖），因此新旧 meta.yaml 都能读。
+display 结果经 `TiUPMeta`（`DisplayInstance` → `MetaServer`）归一，字段映射如下：
 
-| meta.yaml 路径 | 目标 | 说明 |
+| TiUP 拓扑字段 | 目标 | 说明 |
 | --- | --- | --- |
 | `tidb_version` → `cluster_version` → `version` | `clusters.tidb_version` | 按优先级取首个非空；兜底取 MySQL `SELECT VERSION()`；统一补 `v` 前缀（`NormalizeVersion`） |
 | `global.arch` → 各 `*_servers[].arch` | `clusters.cpu_arch` | 真实 meta 常把 arch 写在 server 级；都为空时用 `uname -m` 归一为 `x86_64`/`aarch64` |
-| `topology.pd_servers[]`（`host`/`name`/`ip`、`client_port`、`peer_port`） | `instances(component=pd, port=client_port)` | 无 `port` 时取 `client_port`（默认 2379），`status_port` 取 `peer_port`；首个标记 `role=leader`（可被 PD members 校准） |
-| `topology.tidb_servers[].host/port/status_port/deploy_dir` | `instances(component=tidb, port=4000)` | `status_port=10080` |
-| `topology.tiproxy_servers[]` | `instances(component=tiproxy, port=4000)` | `status_port=3080`；TiDB v7+ 引入，可替代 tidb server 对外 |
-| `topology.tikv_servers[].host/port/status_port/data_dir/deploy_dir` | `instances(component=tikv, port=20160)` | `status_port=20180`；`az` 由 PD stores labels 补齐 |
-| `topology.tiflash_servers[]` | `instances(component=tiflash, port=9000)` | `status_port=8234`；无该段则跳过 |
-| `topology.cdc_servers[]` 或 `topology.ticdc_servers[]` | `instances(component=ticdc, port=8300)` | 兼容两种键名，按 `(component,host,port)` 去重 |
-| display 实例 `Status`（`Up` / `Down` / `Up|L|UI`） | `instances.status` / `instances.role` | 归一为 `up`/`down`/`unhealthy`；`Up|L|UI` 的 `L` 使该 PD 标记 `role=leader`（置于 PD 列表首位）；meta.yaml 无状态字段，缺省 `up` |
-| display `grafana_urls` / `topology.grafana_servers[].port` → `global.grafana_port`(3000) | `clusters.grafana_urls` + `instances(component=grafana)` | **display 的 `grafana_urls` 优先**（去重后直接用）；缺失时才按 server **实际端口**拼 `http://host:port` |
-| display 不提供 Prometheus URL；`topology.monitoring_servers[].port`(9090) | `clusters.prometheus_urls` | 始终按 server 实际端口推导（默认 9090），可多个 |
-| `topology.alertmanager_servers[].port`(9093) | `clusters.alertmanager_urls` | 同上，可多个 |
+| `pd_servers[]`（`host`/`name`/`ip`、`client_port`、`peer_port`） | `instances(component=pd, port=client_port)` | 无 `port` 时取 `client_port`（默认 2379），`status_port` 取 `peer_port`；首个标记 `role=leader`（可被 PD members 校准） |
+| `tidb_servers[].host/port/status_port/deploy_dir` | `instances(component=tidb, port=4000)` | `status_port=10080` |
+| `tiproxy_servers[]` | `instances(component=tiproxy, port=4000)` | `status_port=3080`；TiDB v7+ 引入，可替代 tidb server 对外 |
+| `tikv_servers[].host/port/status_port/data_dir/deploy_dir` | `instances(component=tikv, port=20160)` | `status_port=20180`；`az` 由 PD stores labels 补齐 |
+| `tiflash_servers[]` | `instances(component=tiflash, port=9000)` | `status_port=8234`；无该段则跳过 |
+| `cdc_servers[]` 或 `ticdc_servers[]` | `instances(component=ticdc, port=8300)` | 兼容两种键名，按 `(component,host,port)` 去重 |
+| display 实例 `Status`（`Up` / `Down` / `Up|L|UI`） | `instances.status` / `instances.role` | 归一为 `up`/`down`/`unhealthy`；`Up|L|UI` 的 `L` 使该 PD 标记 `role=leader`（置于 PD 列表首位）；display 未给状态时记 `unknown`，**绝不默认 up** |
+| display `grafana_urls` / `grafana_servers[].port` → `global.grafana_port`(3000) | `clusters.grafana_urls` + `instances(component=grafana)` | **display 的 `grafana_urls` 优先**（去重后直接用）；缺失时才按 server **实际端口**拼 `http://host:port` |
+| display 不提供 Prometheus URL；`monitoring_servers[].port`(9090) | `clusters.prometheus_urls` | 始终按 server 实际端口推导（默认 9090），可多个 |
+| `alertmanager_servers[].port`(9093) | `clusters.alertmanager_urls` | 同上，可多个 |
 | display `dashboard_urls`；缺失时 PD host + `client_port` | `clusters.dashboard_urls` | TiDB Dashboard 由 PD 提供；**display 给出显式地址时直接采用**，否则按 `http://<pd>:<client_port>/dashboard` 推导 |
 | `/pd/api/v1/replication_mode/status` | `clusters.deploy_mode` | `majority` / `dr-auto-sync` → 归一 `majority`/`dr_auto_sync` |
 | `information_schema.cluster_hardware` + `cluster_load` | `hosts.cpu_arch/cpu_cores/memory_gb/disk_total_gb/*_usage_pct` | MySQL 一次查询覆盖**集群内所有主机**；SSH 只采中控机且优先，MySQL 负责给其余主机补齐（字段级只补空，不覆盖 SSH 实测值，见 §6.6.5） |
 
 派生字段均在 `NormalizeMeta` 内一次算出：`instance_count` = 实例条数、`host_count` = 去重主机数、`component_count` = 去重组件种类数（含 tiproxy）。实例 `version` 统一用集群版本填充，避免出现 PD 返回的 `8.5.5` 与 meta 的 `v8.5.5` 两种写法并存。
 
-**meta.yaml 路径解析**（`ssh.go: metaPath()`）：
+**命令白名单**：SSH 执行一律走 `pkg/sshcmd` 的命令白名单（`command -v tiup`、`ls -d`、`cat`、`uname`、`nproc`、`free`、`df`、`<tiup 绝对路径> cluster display [--format=json]`）。模板支持多个位置参数（二进制路径 + 集群名），**每个参数都必须匹配 `[A-Za-z0-9._/-]` 白名单，禁止任何用户输入直接拼接**；定位到的 tiup 路径同样要过白名单，异常输出一律回落到裸 `tiup`。
 
-| 采集器所在机器 | 路径 |
-| --- | --- |
-| 远程（SSH） | 优先 `~/.tiup/storage/cluster/clusters/<name>/meta.yaml`，回退 `/root/.tiup/...` 及 `$TIUP_HOME` |
-| 本机（TiUP 与平台同机） | `os.UserHomeDir() + /.tiup/storage/cluster/clusters/<name>/meta.yaml`，**本地直读，无需 sshd** |
-
-**降级兜底**：优先 `tiup cluster display <name> --format=json`；失败读 meta.yaml；再失败执行 `tiup cluster display <name>` 解析文本表（头部 `Cluster version` / `Dashboard URL(s)` / `Grafana URL(s)`，表格列 ID / Role / Host / Ports / OS-Arch / Status / Data Dir / Deploy Dir，含 `tiproxy`、`monitoring`→prometheus、`cdc`→ticdc、`alert_manager`→alertmanager 别名归一）；三级全失败则该通道记 error 并在 message 里带上各级原因。SSH 执行一律走 `pkg/sshcmd` 的命令白名单（`cat`、`uname`、`nproc`、`free`、`df`、`tiup cluster display`、`tiup cluster display --format=json`），**路径与集群名必须校验白名单字符 `[A-Za-z0-9._/-]`，禁止任何用户输入拼接**。
-
-**本机直读（`IsLocalHost`）**：当目标主机 IP 属于本机（`127.0.0.1`/`::1`/`localhost`/本机网卡地址）时，`sshcmd` 改用 `LocalRunner` 以 `/bin/sh -c` 本地执行同一条命令，仍走同一份命令白名单，行为与 SSH 路径完全一致，避免"TiUP 就在本机却因未装 sshd 采不到数"。
+**只有 SSH 一种取数方式**：平台不做「与本机同机就本地直读」的分支——无论 TiUP 中控机与平台是否同机，一律 `sshcmd.Dial` 远程登录后执行，填 `127.0.0.1` 也要求本机开启 sshd。这样采集路径唯一、排错口径一致，也避免「本机跑通、换台机器就失败」的两套语义。
 
 #### 6.3.1 数据来源可观测与状态交叉校验
 
-**问题背景**：`tiup cluster display` 的 Status 列是 TiUP 自己发起的一次性探测结果，会因瞬时超时把整排实例误报为 `Down`（实测出现过：集群进程全程未重启、TiDB 日志持续正常，但 display 显示 5 个实例全 Down 且 Dashboard URL 整行缺失）；反过来，meta.yaml 兜底路径**没有状态字段**，代码统一按 `up` 填写。两种情形都会让界面显示与真相不符，而原来的采集日志只写"解析到 N 个实例"，用户无法判断数据从哪来、是否可信。
+**问题背景**：`tiup cluster display` 的 Status 列是 TiUP 自己发起的一次性探测结果，会因瞬时超时把整排实例误报为 `Down`（实测出现过：集群进程全程未重启、TiDB 日志持续正常，但 display 显示 5 个实例全 Down 且 Dashboard URL 整行缺失）。而原来的采集日志只写"解析到 N 个实例"，用户无法判断数据从哪来、是否可信。
 
 **来源可观测**：每次采集把来源写入 `TiUPMeta.Source` → `Snapshot.Source` → `clusters.collect_source`，并在任务日志第 2 步输出中文名：
 
@@ -1080,9 +1071,10 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | `display_json` | `tiup cluster display --format=json` | `元数据来源 tiup cluster display --format=json` | 最高，含实例运行状态 |
 | `display_text` | `tiup cluster display` 文本输出 | `元数据来源 tiup cluster display 文本输出` | 同上，靠文本解析 |
-| `meta_yaml` | `~/.tiup/.../meta.yaml` | `元数据来源 meta.yaml（降级）` + **warn**「meta.yaml 不含实例运行状态，本次实例状态为默认值 up，不能作为故障判断依据」 | 拓扑可信、状态不可信 |
 
-详情页「采集快照」展示 `数据来源`，`meta_yaml` 时额外打橙色「降级」标签。
+> `meta_yaml` 已不再产生（历史数据仍按 `meta.yaml` 展示）。实例状态唯一来源是 display；display 不可用时界面显示「实例信息获取失败」，不再有降级拓扑。
+
+详情页「采集快照」展示 `数据来源`，仅用于区分 JSON / 文本两种 display 解析路径。
 
 **状态交叉校验（`crossCheckStatus`，`collector/composite.go`）**：用平台自有通道的实测连通性校验 TiUP 报告的状态，**只告警、不改写状态**（改写会掩盖真实故障）。四条规则：
 
@@ -1091,7 +1083,7 @@ sequenceDiagram
 | 1 | PD 通道成功，但报告 `pd` 状态非 up | PD 的 2379 实测可访问，TiUP 的 Down 很可能是一次失败探测 |
 | 2 | MySQL 通道成功，但**全部** tidb 状态非 up | 4000 能连上，与"全部 TiDB 挂了"矛盾 |
 | 3 | PD 通道成功且有 up store，但全部 tikv 状态非 up | PD 认为 store 活着，与"全部 TiKV 挂了"矛盾 |
-| 4 | MySQL 通道失败，但拓扑显示 tidb 全部正常 | 反向场景：meta.yaml 兜底时最常见的"假正常" |
+| 4 | MySQL 通道失败，但 TiUP 显示 tidb 全部正常 | 反向场景：display 与实测连通性矛盾 |
 
 告警写入 `clusters.collect_warnings`（JSON 数组，**每次采集重写，空则清空**，避免旧提示长期挂在界面上），任务日志逐条 `warn`，详情页顶部以橙色 alert 列出。部分实例 down（多 TiDB 集群）不触发告警，因为无法定位是哪一个。
 
@@ -1113,8 +1105,10 @@ sequenceDiagram
 
 | 项 | 值 | 来源 |
 | --- | --- | --- |
-| 单通道超时 | 10s | `settings.collect.timeout_sec` |
-| 单集群整体超时 | 15s（SSH 5s + DB 5s + PD 5s 并行，取 max + 汇总开销） | 常量 `collectTotalTimeout` |
+| 单条 SSH 命令超时 | 30s（默认，5~300 可调） | `settings.ssh.timeout_sec`（系统设置 → 采集配置 → SSH 命令超时） |
+| SSH 通道窗口 | `5s 建连 + 3 × 命令超时` | `collector.CommandTimeouts.SSHWindow()`，覆盖「定位 tiup + display JSON + display 文本」 |
+| 单通道超时（MySQL / PD） | 10s | `settings.collect.timeout_sec` |
+| 单集群整体超时 | 取 `15s` 与「SSH 通道窗口」的较大者 | 常量 `TotalTimeout` + `CommandTimeouts.SSHWindow()` |
 | 连接测试单项超时 | 5s，整体 15s | PRD R-06 |
 | 采集失败重试 | 1 次，指数退避 2s | `settings.collect.retry`；仅在「网络类错误」重试，认证类错误不重试 |
 | 并发采集 | 默认 4（worker pool 大小），超出排队不失败 | `settings.collect.concurrency` |
@@ -1168,7 +1162,7 @@ POST /api/v1/clusters/:id/refresh
 | 9 | `mysql.Capabilities` | 始终执行 | 不记错误 |
 | 10 | `pd.FetchClusterStatus` + `FetchStores` | 始终执行 | `KindPD` |
 
-超时是两层叠加：整体 `TotalTimeout=15s` 的 `ctx`，每个 goroutine 再套自己的 `ChannelTimeout=10s`；上下文整体到期时 `Collect` 返回 error（任务失败），单通道到期只记一条通道错误。
+超时是两层叠加：整体窗口（`TotalTimeout=15s` 与 SSH 通道窗口取大）的 `ctx`，每个 goroutine 再套自己的通道超时（MySQL/PD 为 `ChannelTimeout=10s`，SSH 为 `SSHWindow`）；上下文整体到期时 `Collect` 返回 error（任务失败），单通道到期只记一条通道错误。SSH 单条命令上限默认 30s，因此 SSH 的实际耗时会超过 15s —— 这是把「大集群 display 慢」与「网络卡死」分开处理的代价：宁可等 30s 拿到真实拓扑，也不要 5s 就误判 display 不可用。
 
 `Probe`（连接测试/接管前置探测）与 `Collect` 的区别：`Probe` 只返回**本次请求的 scope**，按 SSH → MySQL → PD 固定顺序，不返回「未执行该项探测」的占位项——调用方按下标取值，占位项会导致误判（该 bug 已由 `composite_probe_test.go` 锁定）。
 
@@ -1176,7 +1170,7 @@ POST /api/v1/clusters/:id/refresh
 
 | 通道 | 入口 | 实际动作 |
 | --- | --- | --- |
-| SSH 拓扑 | `ssh.go:116 FetchTiUPMeta` | 三级取值（前一级成功即返回）：① `tiup cluster display <name> --format=json`（模板 `tiup_display_json`，`ParseDisplayJSON`，含 `cluster_version`/`dashboard_urls`/`grafana_urls` 与实例状态）→ ② `cat <tiup_dir>/storage/cluster/clusters/<name>/meta.yaml` + `yaml.Unmarshal` → ③ `tiup cluster display <name>` 文本输出（模板 `tiup_display`，`ParseDisplayText`，头部键值行 + 空格对齐表格）；三级全失败则聚合各级原因记通道错误。`Source` 字段标注本次来源 `display_json`/`meta_yaml`/`display_text` |
+| SSH 拓扑 | `ssh.go: FetchTiUPMeta` | 先 `resolveTiUPBin` 定位 tiup 绝对路径（`command -v` → `$HOME/.tiup/bin/tiup` → `<TiUPDir>/bin/tiup`），再两级取值（前一级成功即返回）：① `tiup cluster display <name> --format=json`（模板 `tiup_display_json`，`ParseDisplayJSON`，含 `cluster_version`/`dashboard_urls`/`grafana_urls` 与实例状态）→ ② `tiup cluster display <name>` 文本输出（模板 `tiup_display`，`ParseDisplayText`）；两级全失败则聚合原因，报「实例信息获取失败：tiup cluster display 不可用」。`Source` 只可能是 `display_json`/`display_text`，不读 meta.yaml |
 | SSH 主机 | `ssh.go:210` | `arch` / `hostname` / `nproc` / `free -m` / `df -Pm`；CPU 使用率读两次 `/proc/stat` 间隔 200ms 求差。**只采中控机**这一台（其余主机无凭据，也不该逐台登录） |
 | MySQL 主机硬件 | `mysql.go:FetchHostHardware` | 一次查询覆盖集群内**所有**主机，无需逐台 SSH：① `information_schema.cluster_hardware`（`TYPE,INSTANCE,DEVICE_TYPE,DEVICE_NAME,NAME,VALUE`）取 `cpu/cpu-arch`、`cpu/cpu-logical-cores`（缺失退 `cpu-physical-cores`）、`memory/memory/capacity`（字节）、`disk/<设备>/path,total,used,used-percent`（按挂载点聚合、取 total 最大的那块盘）；② `information_schema.cluster_load` 取 `cpu/usage/idle`（使用率 =(1-idle)×100）与 `memory/virtual/used-percent`（×100，`memory/swap` 的 `NaN` 必须忽略）。`INSTANCE` 为真实地址（如 `10.10.10.10:4000`），`0.0.0.0` / `::` / 回环一律跳过（本机由 SSH 通道负责） |
 | MySQL 信息 | `mysql.go:124` | `information_schema.cluster_info` → 版本 + 实例数 + 主机数；不可用时退 `SELECT VERSION()` |
@@ -1264,7 +1258,7 @@ Kill 走 `KILL TIDB <id>`（跨实例生效），失败再退回普通 `KILL <id
 | 版本有值但实例数为 0 | `tiup cluster display` 输出未识别，按 6.3 补映射（注意文本路径 Host 列可能是主机名） |
 | `PD 返回 HTTP 404` | PD 地址填成了 TiDB 的 4000 端口，或集群走 TiProxy |
 | 全部通道失败且 `fail_streak` 达阈值 | 集群置 `error`，核对网络/凭据；凭据类错误仓库不重试 |
-| 界面状态与 `tiup cluster display` 不一致 | 先看详情页「采集快照 · 数据来源」：`meta.yaml` 说明 display 不可用、状态是默认值；再看顶部交叉校验告警。若来源是 `display_json` 仍有告警，说明 TiUP 那次探测失败，点「立即采集」重采一次即可 |
+| 界面状态与 `tiup cluster display` 不一致 | 先看详情页「采集快照 · 数据来源」：为空说明 display 不可用（顶部横幅显示「实例信息获取失败」及原因）；来源是 `display_json` 时若仍有告警，说明 TiUP 那次探测失败，点「立即采集」重采一次即可 |
 | 主机页中控机显示 `0C / 0G`，其余主机正常 | 中控机是 macOS/非 Linux 环境：SSH 模板 `nproc`、`free`、`/proc/stat` 不存在（`arch`/`hostname`/`df` 仍可用），属环境限制；Linux 中控机不受影响 |
 | 主机页某台机器规格为空 | 先看该集群采集是否成功：硬件规格来自 `cluster_hardware`（需 `PROCESS` 权限），失败会静默降级为主机仅 IP 占位；补权限后重新采集即可，不会影响集群健康状态 |
 | 「会话」页数据很旧 | 点右上「刷新会话」：它走 `live=1` 实时查 `cluster_processlist`，不走采集任务；若提示「实时查询失败」，按返回的 `reason` 检查数据库凭据/网络/`PROCESS` 权限，页面此时展示的是上次采集快照 |
@@ -1312,7 +1306,7 @@ stateDiagram-v2
 | type | 触发 | 步骤（seq 顺序） | 超时 |
 | --- | --- | --- | --- |
 | `takeover` | 接管提交 F-18 | 1 校验参数 → 2 SSH 连通 → 3 DB 连通 → 4 PD 探测 → 5 读取拓扑 → 6 落库 → 7 完成 | 60s |
-| `collect` | 手动刷新 F-21 / 调度周期 / 接管后 | 1 能力探测 → 2 SSH 拓扑 → 3 MySQL 对象 → 4 PD 状态 → 5 归一化落库 | 15s |
+| `collect` | 手动刷新 F-21 / 调度周期 / 接管后 | 1 能力探测 → 2 SSH 拓扑 → 3 MySQL 对象 → 4 PD 状态 → 5 归一化落库 | ≥15s（SSH 命令超时可配，默认 30s） |
 | `inspect` | F-52 | 1 加载模板 → 2 采集最新快照（复用 collect 逻辑） → 3 逐项判定（每项一个子步骤，进度按项数均分） → 4 汇总统计 → 5 生成报告 | 120s |
 | `ssh_check` | F-48 | 1 解析主机 → 2 逐主机探测（每台一子步骤） → 3 回写 `hosts.ssh_status` | 90s |
 | `create_tidb_user` | F-34 | 1 校验标识符白名单 → 2 预检重名 → 3 CREATE USER → 4 授权 → 5 刷新用户快照 | 30s |
@@ -1465,7 +1459,7 @@ axios.create({ baseURL: import.meta.env.VITE_API_BASE + '/api/v1', timeout: 2000
 | **T-01** | 项目骨架与基础设施 | F-70(部分)、NFR 9.3 | `Makefile`、`backend/go.mod`、`backend/cmd/tmp/main.go`、`backend/web/embed.go`、`backend/web/dist/.gitkeep`、`backend/internal/config/{config,version}.go`、`backend/internal/db/{db,migrate}.go`、`backend/internal/api/{router,response,middleware}.go`、`backend/internal/pkg/logger/*`、`frontend/package.json`、`frontend/vite.config.ts`、`frontend/tsconfig.json`、`frontend/index.html` | — | `CGO_ENABLED=0 go build` 通过；启动生成 `tmp.db` 并 AutoMigrate 出 19 张表；`GET /healthz` 200；`GET /` 返回嵌入 index.html（前端未构建时返回占位页不 panic）；`/api/v1/*` 未认证返回 40101 |
 | **T-02** | 认证、RBAC 与审计内核 | F-01/02/06/07 | `internal/auth/{jwt,password,rbac,middleware}.go`、`internal/crypto/aesgcm.go`、`internal/service/{user,auth,audit}_service.go`、`internal/api/auth_handler.go`、`internal/repo/{user,audit}_repo.go`、`internal/db/seed.go` | T-01 | 空库首启跳 `/api/v1/setup/status`=false，`POST /setup/init` 建 admin（must_change_password=1）；登录成功签发 JWT，连续 5 次失败锁 10 分钟（42901 + `lockedUntil`）；过期/篡改 token → 40101；viewer 调写接口 → 40301 并落审计；AES-GCM 加解密往返一致 |
 | **T-03** | 模型补全 + 平台用户/角色 API | F-03/04/05/06/08 | `internal/model/*.go`（19 个结构体）、`internal/repo/user_repo.go`、`internal/service/user_service.go`、`internal/api/user_handler.go`、`internal/repo/setting_repo.go`、`internal/service/setting_service.go` | T-02 | 全部 model 与 §4.1 DDL 逐字段对齐（含索引 tag）；用户 CRUD/禁用/重置密码可用；最后一个 admin 不可降级（40001）；列表不返回 password_hash；`GET /roles/matrix` 与 PRD 8.4 完全一致 |
-| **T-04** | 采集适配层（4 实现 + 归一化） | F-16/17/18/21/22 的采集内核、D-6/D-7 | `internal/collector/{collector,composite,ssh,mysql,pd,mock,mapping,cap}.go`、`internal/pkg/{sshcmd,sqlsafe,retry}/*`、`internal/service/capability_service.go` | T-03 | mock 模式返回 3 套集群完整 Snapshot；真实三通道各自 `Probe` 返回 ok/失败原因与耗时；`Capabilities` 对 6.5/7.1 返回 `supportsResourceGroup=false`；meta.yaml 解析出 instances 且字段映射符合 §6.3；单集群整体超时 15s 生效；无用户输入可注入命令 |
+| **T-04** | 采集适配层（4 实现 + 归一化） | F-16/17/18/21/22 的采集内核、D-6/D-7 | `internal/collector/{collector,composite,ssh,mysql,pd,mock,mapping,cap}.go`、`internal/pkg/{sshcmd,sqlsafe,retry}/*`、`internal/service/capability_service.go` | T-03 | mock 模式返回 3 套集群完整 Snapshot；真实三通道各自 `Probe` 返回 ok/失败原因与耗时；`Capabilities` 对 6.5/7.1 返回 `supportsResourceGroup=false`；display 解析出 instances 且字段映射符合 §6.3；单集群整体超时 15s 生效；无用户输入可注入命令 |
 | **T-05** | 任务引擎 + 步骤/日志 + 恢复 | F-59/60/61/62 | `internal/job/{engine,types,handlers,recover}.go`、`internal/repo/job_repo.go`、`internal/service/job_service.go`、`internal/api/job_handler.go`、`internal/model/job*.go` | T-03 | 有界队列 + worker pool；步骤与日志按 §7.3 落库；`GET /jobs/:id/logs?afterSeq` 可增量拉取；重启用 running→interrupted、pending 重新入队；panic 不拖垮 worker |
 | **T-06** | 集群接管/列表/详情 + 采集调度 | F-14/15/16/17/18/21/22/23/24/25/26/27 | `internal/service/cluster_service.go`、`internal/repo/{cluster,instance,host,credential}_repo.go`、`internal/api/cluster_handler.go`、`internal/job/handlers.go`（takeover/collect）、`internal/api/scheduler.go` | T-04、T-05 | 连接测试 3 项独立展示、整体 15s；接管提交建异步任务并跳详情；重复集群名 40001；刷新幂等复用进行中任务；拓扑接口节点数 = 实例数；组件版本聚合与不一致提示；连续 3 次失败置 error 且仍可看快照；草稿不计统计 |
 | **T-07** | 主机聚合视图 | F-45/46 | `internal/service/host_service.go`、`internal/repo/host_repo.go`、`internal/api/host_handler.go`、`internal/collector/mapping.go`（主机归一） | T-06 | 同机多实例角色合并（如 `PD+TiKV`）；跨集群共享主机列出全部集群；按主机/按集群两种视图数据一致；筛选数与列表 total 一致 |

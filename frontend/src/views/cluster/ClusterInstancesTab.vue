@@ -13,7 +13,7 @@
       <div class="toolbar-right text-muted">共 {{ total }} 个实例</div>
     </div>
 
-    <el-table v-loading="loading" :data="rows" size="small" empty-text="暂无实例数据">
+    <el-table v-loading="loading" :data="rows" size="small" empty-text="暂无实例数据：tiup cluster display 未返回结果，请查看顶部失败原因">
       <el-table-column prop="component" label="组件" width="120" />
       <el-table-column label="地址" min-width="180">
         <template #default="{ row }">

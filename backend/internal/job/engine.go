@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,6 +17,32 @@ import (
 	"github.com/tmp-platform/backend/internal/pkg/idgen"
 	"github.com/tmp-platform/backend/internal/repo"
 )
+
+// jobTimeout 计算任务整体超时。
+//
+// SSH 单命令上限可在「系统设置」里调（默认 30s，最长 300s），而 collect
+// 的固定超时只有 15s —— 直接用它当任务 ctx 会让设置项失效（display 还没
+// 回来任务就被取消）。因此对含 SSH 拓扑采集的任务，把下限抬到
+// 「SSH 通道窗口 + 其余通道开销」。
+func (e *Engine) jobTimeout(ctx context.Context, spec Spec) time.Duration {
+	base := spec.Timeout
+	switch spec.Type {
+	case TypeCollect, TypeTakeover, TypeInspect:
+		sec := int(collector.DefaultSSHCommandTimeout / time.Second)
+		if e.deps.Settings != nil {
+			if v, err := e.deps.Settings.Get(ctx, repo.SettingSSHTimeoutSec); err == nil {
+				if n, cerr := strconv.Atoi(v); cerr == nil && n > 0 {
+					sec = n
+				}
+			}
+		}
+		floor := collector.SSHConnectTimeout + time.Duration(sec)*time.Second*3 + collector.ChannelTimeout
+		if floor > base {
+			return floor
+		}
+	}
+	return base
+}
 
 // 队列常量（ARCHITECTURE §7.3）。
 const (
@@ -233,7 +260,7 @@ func (e *Engine) run(ctx context.Context, id int64, workerIdx int) {
 		return
 	}
 
-	jobCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
+	jobCtx, cancel := context.WithTimeout(ctx, e.jobTimeout(ctx, spec))
 	defer cancel()
 
 	runErr := e.safeExecute(jobCtx, handler, r, job, workerIdx)

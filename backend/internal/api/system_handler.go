@@ -116,6 +116,7 @@ func (h *Handlers) UpdateCollectionSettings(c *gin.Context) {
 		"timeoutSec":    in.TimeoutSec,
 		"concurrency":   in.Concurrency,
 		"retry":         in.Retry,
+		"sshTimeoutSec": in.SSHTimeoutSec,
 		"cpuThreshold":  in.ThresholdCPUPct,
 		"diskThreshold": in.ThresholdDiskPct,
 	})

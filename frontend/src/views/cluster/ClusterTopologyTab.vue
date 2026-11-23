@@ -13,7 +13,7 @@
       </div>
     </div>
 
-    <el-empty v-if="!loading && !hosts.length && !groups.length" description="暂无拓扑数据，请先执行采集" />
+    <el-empty v-if="!loading && !hosts.length && !groups.length" description="暂无拓扑数据：tiup cluster display 未返回结果，请查看顶部失败原因" />
 
     <!-- 主视角：每台主机上部署了哪些实例 -->
     <div v-if="view === 'host'" class="topology">

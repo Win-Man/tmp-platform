@@ -15,8 +15,9 @@ const discoveryTimeout = 10 * time.Second
 
 // PDDiscovery PD 地址自动发现结果。
 //
-// 接管集群时 PD 地址无需人工填写：TiUP 部署的集群其 PD 拓扑一定写在 meta.yaml 中，
-// 即使 meta.yaml 读不到，TiDB 的 information_schema.cluster_info 也能给出 PD 实例地址。
+// 接管集群时 PD 地址无需人工填写：TiUP 部署的集群其 PD 拓扑一定能从
+// `tiup cluster display` 得到；display 不可用时，TiDB 的 information_schema.cluster_info
+// 也能给出 PD 实例地址。
 type PDDiscovery struct {
 	// Endpoints 归一化后的 PD 客户端地址（http://host:2379），已去重排序。
 	Endpoints []string `json:"endpoints"`
@@ -71,7 +72,7 @@ func normalizePDEndpoint(raw string) string {
 	return scheme + "://" + net.JoinHostPort(host, port)
 }
 
-// pdEndpointsFromServers 把 meta.yaml 的 pd_servers 段转换为归一化地址列表。
+// pdEndpointsFromServers 把 TiUP 拓扑的 pd_servers 段转换为归一化地址列表。
 func pdEndpointsFromServers(servers []MetaServer) []string {
 	out := make([]string, 0, len(servers))
 	seen := make(map[string]bool, len(servers))
@@ -101,7 +102,7 @@ func pdEndpointsFromServers(servers []MetaServer) []string {
 // DiscoverPD 真实模式自动发现 PD 地址。
 //
 // 优先级：
-//  1. SSH 读取 TiUP 元数据（meta.yaml 的 pd_servers）——最权威，部署工具即真值来源；
+//  1. SSH 执行 `tiup cluster display`（pd_servers）——最权威，部署工具即真值来源；
 //  2. MySQL 查询 information_schema.cluster_info 中 type='pd' 的实例——TiDB 视角的运行时真值；
 //
 // 两条通道都不通时返回错误，由上层决定是否降级（PD 为建议项，不影响纳管）。

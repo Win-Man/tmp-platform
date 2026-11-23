@@ -6,7 +6,7 @@
 #   sudo ./install.sh                          # 默认装到 /opt/tmp，端口 8080，用户 tmp
 #   sudo ./install.sh --port 9000              # 自定义端口
 #   sudo ./install.sh --prefix /data/tmp       # 自定义安装目录
-#   sudo ./install.sh --user tiup              # 用已有用户运行（接管同机 TiUP 集群时常用）
+#   sudo ./install.sh --user tiup              # 用已有用户运行（按内网账号规范选填）
 #   sudo ./install.sh --no-systemd             # 只铺文件，不注册服务（容器/无 systemd 环境）
 #
 # 脚本只使用系统自带命令（bash/coreutils/systemctl），不依赖网络。

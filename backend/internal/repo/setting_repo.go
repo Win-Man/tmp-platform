@@ -15,6 +15,7 @@ const (
 	SettingCollectTimeoutSec  = "collect.timeout_sec"
 	SettingCollectConcurrency = "collect.concurrency"
 	SettingCollectRetry       = "collect.retry"
+	SettingSSHTimeoutSec      = "ssh.timeout_sec"
 	SettingJWTTokenTTLHours   = "auth.jwt_ttl_hours"
 	SettingAuthIdleTimeoutMin = "auth.idle_timeout_min"
 	SettingModeMock           = "mode.mock"
@@ -32,6 +33,7 @@ var DefaultSettings = map[string]string{
 	SettingCollectTimeoutSec:  "10",
 	SettingCollectConcurrency: "4",
 	SettingCollectRetry:       "1",
+	SettingSSHTimeoutSec:      "30",
 	SettingJWTTokenTTLHours:   "8",
 	SettingAuthIdleTimeoutMin: "30",
 	SettingModeMock:           "false",

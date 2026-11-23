@@ -31,9 +31,9 @@ const (
 
 // 采集相关超时常量（ARCHITECTURE §6.5）。
 const (
-	// ChannelTimeout 单通道超时。
+	// ChannelTimeout MySQL / PD 单通道超时（SSH 通道按 CommandTimeouts.SSHWindow 计算）。
 	ChannelTimeout = 10 * time.Second
-	// TotalTimeout 单集群整体超时。
+	// TotalTimeout 单集群整体超时下限（SSH 窗口更大时以 SSH 窗口为准）。
 	TotalTimeout = 15 * time.Second
 	// ProbeItemTimeout 连接测试单项超时。
 	ProbeItemTimeout = 5 * time.Second
@@ -102,7 +102,7 @@ type Channel interface {
 	Probe(ctx context.Context, t *Target) (ProbeResult, error)
 }
 
-// MetaServer TiUP meta.yaml 中的单条 server 定义。
+// MetaServer TiUP 拓扑中的单条 server 定义（display 解析结果与 meta.yaml 共用同一结构）。
 type MetaServer struct {
 	Host       string `yaml:"host" json:"host"`
 	IP         string `yaml:"ip" json:"ip"`
@@ -120,13 +120,13 @@ type MetaServer struct {
 	AZ         string `yaml:"az" json:"az"`
 	NumaNode   string `yaml:"numa_node" json:"numaNode"`
 	// Status 实例状态（up/down/unhealthy/unknown）。
-	// 只有 `tiup cluster display` 解析路径会填该字段；meta.yaml 里没有状态信息，
-	// 保持空字符串时由 normalizeServers 按历史行为默认 up。
+	// 唯一来源是 `tiup cluster display` 的状态列；为空时 normalizeServers 记 unknown，
+	// 绝不默认成 up（避免「没采到状态」被界面读成「正常」）。
 	Status string `yaml:"status" json:"status,omitempty"`
 }
 
-// TiUPMeta TiUP 集群元数据（meta.yaml）。
-// MetaGlobal meta.yaml 的 global 段（集群级默认配置）。
+// TiUPMeta TiUP 集群元数据（`tiup cluster display` 解析结果）。
+// MetaGlobal 集群级默认配置（display 解析时用于承接架构等全局信息）。
 type MetaGlobal struct {
 	User        string `yaml:"user" json:"user"`
 	Group       string `yaml:"group" json:"group"`
@@ -228,7 +228,7 @@ type TiUPMeta struct {
 	// （yaml:"-"），由 collector 显式填充。
 	DashboardURLs []string `yaml:"-" json:"dashboardUrls,omitempty"`
 	GrafanaURLs   []string `yaml:"-" json:"grafanaUrls,omitempty"`
-	// Source 元数据来源：display_json / display_text / meta_yaml。
+	// Source 元数据来源：display_json / display_text。
 	Source string `yaml:"-" json:"source,omitempty"`
 
 	PdServers           []MetaServer `yaml:"pd_servers" json:"pdServers"`
@@ -376,14 +376,14 @@ type Snapshot struct {
 	Capabilities *Capabilities
 	// Stores PD 返回的 TiKV store 列表（容量水位巡检与拓扑校准用）。
 	Stores []Store
-	// Normalized meta.yaml 的归一化结果（实例 / 地址 / 版本 / 架构）。
+	// Normalized display 解析结果的归一化产物（实例 / 地址 / 版本 / 架构）。
 	Normalized *Normalized
 	// DeployModeHint PD 通道给出的部署模式提示（majority / dr_auto_sync）。
 	DeployModeHint string
 	ChanErrors     map[Kind]string
 	FetchedAt      time.Time
 	Mock           bool
-	// Source 本次元数据的来源（display_json / display_text / meta_yaml），
+	// Source 本次元数据的来源（display_json / display_text），
 	// 由 Meta.Source 透传，落库后供界面展示「这批数据是从哪采的」。
 	Source string
 	// Consistency 交叉校验告警：display 报告的实例状态与平台自有通道

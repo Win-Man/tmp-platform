@@ -250,8 +250,9 @@ func TestNormalizeMeta_VersionFallback(t *testing.T) {
 	}
 }
 
-// TestMergeInstances_TiKVStatus 断言 PD store 状态覆盖 TiKV 实例状态与 AZ。
-func TestMergeInstances_TiKVStatus(t *testing.T) {
+// TestMergeInstances_KeepsDisplayStatus 断言 PD store 不得改写实例状态，
+// 只允许补齐 AZ / 空版本 —— 状态唯一来源是 `tiup cluster display`。
+func TestMergeInstances_KeepsDisplayStatus(t *testing.T) {
 	base := []InstanceSnapshot{
 		{Component: "tikv", HostIP: "10.0.10.21", Port: 20160, Status: "up"},
 		{Component: "tikv", HostIP: "10.0.10.22", Port: 20160, Status: "up"},
@@ -260,11 +261,11 @@ func TestMergeInstances_TiKVStatus(t *testing.T) {
 		{Address: "10.0.10.22:20160", StateName: "Offline", Version: "v7.5.2", Labels: map[string]string{"zone": "z2"}},
 	}
 	got := MergeInstances(base, stores)
-	if got[0].Status != "up" {
-		t.Fatalf("未匹配的 TiKV 状态应保持 up，实际 %q", got[0].Status)
+	if got[1].Status != "up" {
+		t.Fatalf("PD 的 Offline 不得覆盖 display 的 up，实际 %q", got[1].Status)
 	}
-	if got[1].Status != "down" {
-		t.Fatalf("Offline store 应映射为 down，实际 %q", got[1].Status)
+	if got[1].Version != "v7.5.2" {
+		t.Fatalf("display 未给版本时应由 store 补齐，实际 %q", got[1].Version)
 	}
 	if got[1].AZ != "z2" {
 		t.Fatalf("AZ 应取 store label zone，实际 %q", got[1].AZ)

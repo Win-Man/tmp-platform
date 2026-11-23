@@ -86,13 +86,13 @@ else warn "可用磁盘 $(( ${avail_kb:-0} /1024 )) MB（建议 ≥ 1 GB）"; fi
 mem_mb="$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
 [ "${mem_mb:-0}" -ge 1024 ] && ok "内存 ${mem_mb} MB" || warn "内存 ${mem_mb} MB（建议 ≥ 1 GB）"
 
-# 8. 与本机 TiUP 的关系（可选提示）
+# 8. 本机 TiUP（仅提示接管时应填的 SSH 用户）
 if [ -d "$HOME/.tiup/storage/cluster/clusters" ]; then
-  warn "检测到当前用户 $HOME/.tiup 有集群元数据；若平台用其他用户运行，需按手册 §6.1 授权"
+  ok "本机 $(id -un) 用户有 TiUP 元数据：接管时 SSH 用户填 $(id -un)"
 elif [ -d /root/.tiup/storage/cluster/clusters ]; then
-  warn "检测到 /root/.tiup 有集群元数据；默认 tmp 用户读不到，见手册 §6.1"
+  warn "检测到 /root/.tiup 有集群元数据：接管时 SSH 用户填 root"
 else
-  ok "本机未发现 TiUP 元数据（如需同机接管，请确认部署目录）"
+  ok "本机未发现 TiUP 元数据（接管远程中控机时无需本机安装 TiUP）"
 fi
 
 echo
