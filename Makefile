@@ -5,6 +5,7 @@
 #   make backend-build    # 仅编译后端（使用已存在的前端产物）
 #   make frontend-build   # 仅构建前端到 backend/web/dist
 #   make run              # 构建并以演示模式启动（TMP_MOCK=true）
+#   make serve            # 构建并以真实采集模式启动（数据目录=仓库根）
 #   make dev-backend      # 后端热启动（不加 mock，连真实集群）
 #   make dev-frontend     # 前端开发服务器（代理到 :8080）
 #   make test / fmt / vet / clean
@@ -13,7 +14,7 @@ SHELL := /bin/bash
 
 # ---- 元信息 ----
 APP        := tmp
-VERSION    ?= 1.0.0-mvp
+VERSION    ?= 1.0.1-mvp
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 ROOT       := $(shell pwd)
@@ -28,7 +29,7 @@ LDFLAGS := -s -w \
 	-X 'github.com/tmp-platform/backend/internal/config.BuildTime=$(BUILD_TIME)' \
 	-X 'github.com/tmp-platform/backend/internal/config.Commit=$(COMMIT)'
 
-.PHONY: help all build backend-build frontend-build frontend-deps typecheck run run-mock dev-backend dev-frontend test fmt vet clean smoke
+.PHONY: help all build backend-build frontend-build frontend-deps typecheck run run-mock serve dev-backend dev-frontend test fmt vet clean smoke
 
 all: build
 
@@ -81,7 +82,15 @@ run: build
 
 run-mock: run
 
-# 真实采集模式启动
+# 真实采集模式启动（连真实集群）
+#
+# 数据目录必须钉死在仓库根：secret.key 与 tmp.db 是同一条命，
+# 换个工作目录启动就会新生成一把密钥，库里已加密的凭据全部作废。
+serve: backend-build
+	@echo ">> 真实采集模式启动（数据目录=$(ROOT)，地址=$${TMP_ADDR:-:8080}，Ctrl-C 退出）"
+	TMP_ADDR=$${TMP_ADDR:-:8080} TMP_DATA_DIR="$(ROOT)" TMP_GIN_MODE=release $(BINARY)
+
+# 后端热启动（数据目录在 backend/data，与 serve 的世界互不相通）
 dev-backend:
 	cd backend && TMP_GIN_MODE=debug $(GO) run ./cmd/tmp
 
